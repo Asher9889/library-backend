@@ -4,37 +4,24 @@ import re
 import ast
 import io
 import base64
-import uuid
-import threading
 from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 import pyodbc
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 # Matplotlib for Chart Generation
 import matplotlib
-matplotlib.use('Agg')  # Backend for server
+matplotlib.use('Agg') # Backend for server
 import matplotlib.pyplot as plt
-import tempfile
-import os
 
-# === NEW IMPORTS FOR REPORT DOWNLOAD ===
-import pandas as pd
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.units import inch
-
-# ==========================================
+app = FastAPI()# ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-os.environ["GROQ_API_KEY"] = "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"
+os.environ["GROQ_API_KEY"] = "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"
 
 CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -50,52 +37,6 @@ CONNECTION_STRING = (
 MAX_ROWS = 100  # Chart banane ke liye thode zyada rows chahiye
 MAX_RETRIES = 5
 _conn = None
-
-# ==========================================
-# REPORT STORE (In-Memory with TTL)
-# ==========================================
-REPORT_STORE: Dict[str, Dict[str, Any]] = {}
-REPORT_TTL_SECONDS = 600  # 10 minutes
-REPORT_LOCK = threading.Lock()
-
-
-def cleanup_expired_reports():
-    """Background cleanup of expired reports."""
-    now = time.time()
-    expired = [
-        rid for rid, rdata in REPORT_STORE.items()
-        if now - rdata["created_at"] > REPORT_TTL_SECONDS
-    ]
-    for rid in expired:
-        REPORT_STORE.pop(rid, None)
-    if expired:
-        print(f"[REPORT_STORE] Cleaned up {len(expired)} expired reports.")
-
-
-def store_report(data: List[Dict], question: str, sql: str) -> str:
-    cleanup_expired_reports()
-    report_id = str(uuid.uuid4())
-    with REPORT_LOCK:
-        REPORT_STORE[report_id] = {
-            "data": data,
-            "question": question,
-            "sql": sql,
-            "created_at": time.time(),
-        }
-    print(f"[REPORT_STORE] Stored report_id={report_id} with {len(data)} rows.")
-    return report_id
-
-
-def get_report(report_id: str) -> Optional[Dict[str, Any]]:
-    with REPORT_LOCK:
-        rdata = REPORT_STORE.get(report_id)
-        if not rdata:
-            return None
-        if time.time() - rdata["created_at"] > REPORT_TTL_SECONDS:
-            REPORT_STORE.pop(report_id, None)
-            return None
-        return rdata
-
 
 # 2. DATABASE CONNECTION & QUERY EXECUTION
 # ==========================================
@@ -226,7 +167,7 @@ MARC TAG DICTIONARY (Exact for this DB):
 ==============================
 SECTION 2: CRITICAL DATA TYPES & JOIN RULES (MUST FOLLOW)
 ==============================
-- `t_issue.acc_no`, `t_receive.accn_no`, `t_book_transfer.acc_no`, `t_replace.old_accco` are **char** with TRAILING SPACES (e.g., '121613     ').
+- `t_issue.acc_no`, `t_receive.accn_no`, `t_book_transfer.acc_no`, `t_replace.old_accno` are **char** with TRAILING SPACES (e.g., '121613     ').
 - `Location.p852` is **nvarchar** WITHOUT trailing spaces.
 - `m_member.mem_cd` is `char`.
 
@@ -446,7 +387,6 @@ class AgentState(TypedDict):
     sql_query: str
     previous_sql: str
     query_result: str
-    report_data: Optional[List[Dict[str, Any]]]   # <-- NEW: raw DB rows preserved
     attempts: int
     error: str
     error_history: List[str]
@@ -496,20 +436,12 @@ def execute_sql_node(state: AgentState):
         data_str = str(result["data"])
         if len(data_str) > 12000:
             data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {result['rows']}]"
-        return {
-            "query_result": data_str,
-            "report_data": result["data"],   # <-- NEW: preserve raw data
-            "error": "",
-        }
+        return {"query_result": data_str, "error": ""}
     else:
         print(f"[DEBUG] SQL ERROR: {result['error']}\n")
         hist = state.get("error_history", [])
         hist.append(result["error"])
-        return {
-            "error": result["error"],
-            "error_history": hist,
-            "report_data": None,
-        }
+        return {"error": result["error"], "error_history": hist}
 
 def check_status_node(state: AgentState):
     if state.get("error"):
@@ -643,9 +575,6 @@ class QueryResponse(BaseModel):
     chart_base64: Optional[str] = None
     attempts: int
     debug_error: Optional[str] = None
-    # ---- NEW FIELDS ----
-    report_available: bool = False
-    report_id: Optional[str] = None
 
 @app.get("/welcome")
 def welcome_api():
@@ -683,8 +612,7 @@ def ask_library_agent(request: QueryRequest):
         "error": "",
         "previous_sql": "",
         "error_history": [],
-        "chart_base64": None,
-        "report_data": None,   # <-- NEW
+        "chart_base64": None
     })
     
     final_answer = final_state.get("query_result", "Agent failed to generate answer.")
@@ -693,192 +621,14 @@ def ask_library_agent(request: QueryRequest):
     db_error = final_state.get("error", None) or None
     chart_b64 = final_state.get("chart_base64", None)
     
-    # ---- NEW: Report generation logic ----
-    report_available = False
-    report_id = None
-    report_data = final_state.get("report_data", None)
-    if report_data and isinstance(report_data, list) and len(report_data) > 0:
-        try:
-            report_id = store_report(
-                data=report_data,
-                question=user_question,
-                sql=executed_sql,
-            )
-            report_available = True
-        except Exception as e:
-            print(f"[REPORT_STORE] Failed to store report: {e}")
-            report_available = False
-    # --------------------------------------
-
     return QueryResponse(
         question=user_question,
         sql_query=executed_sql,
         answer=final_answer,
         chart_base64=chart_b64,
         attempts=final_state.get("attempts", 0),
-        debug_error=db_error,
-        report_available=report_available,
-        report_id=report_id,
+        debug_error=db_error
     )
-
-
-# ==========================================
-# 6. REPORT DOWNLOAD ENDPOINTS (NEW)
-# ==========================================
-@app.get("/report/{report_id}/excel")
-def download_excel(report_id: str):
-    """Download the tabular result as an Excel (.xlsx) file."""
-    rdata = get_report(report_id)
-    if not rdata:
-        raise HTTPException(status_code=404, detail="Report not found or expired.")
-
-    try:
-        df = pd.DataFrame(rdata["data"])
-        # Sanitize NaN/None for cleaner Excel
-        df = df.where(pd.notnull(df), None)
-
-        # Use system's temp directory for cross-platform compatibility
-        tmp_dir = tempfile.gettempdir()
-        tmp_path = os.path.join(tmp_dir, f"report_{report_id}.xlsx")
-        
-        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Report")
-            # Auto-adjust column widths
-            worksheet = writer.sheets["Report"]
-            for col_cells in worksheet.columns:
-                max_length = max(
-                    (len(str(cell.value)) if cell.value is not None else 0)
-                    for cell in col_cells
-                )
-                col_letter = col_cells[0].column_letter
-                worksheet.column_dimensions[col_letter].width = min(max_length + 2, 50)
-
-        return FileResponse(
-            path=tmp_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"library_report_{report_id[:8]}.xlsx",
-        )
-    except Exception as e:
-        print(f"[EXCEL ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
-
-@app.get("/report/{report_id}/pdf")
-def download_pdf(report_id: str):
-    """Download the tabular result as a PDF file."""
-    rdata = get_report(report_id)
-    if not rdata:
-        raise HTTPException(status_code=404, detail="Report not found or expired.")
-
-    try:
-        data = rdata["data"]
-        question = rdata.get("question", "")
-        df = pd.DataFrame(data)
-
-        # Use system's temp directory for cross-platform compatibility
-        tmp_dir = tempfile.gettempdir()
-        tmp_path = os.path.join(tmp_dir, f"report_{report_id}.pdf")
-        
-        doc = SimpleDocTemplate(
-            tmp_path,
-            pagesize=landscape(A4),
-            rightMargin=30, leftMargin=30,
-            topMargin=30, bottomMargin=30,
-        )
-
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            "CustomTitle",
-            parent=styles["Title"],
-            fontSize=16,
-            textColor=colors.HexColor("#1a5276"),
-            spaceAfter=6,
-        )
-        sub_style = ParagraphStyle(
-            "CustomSub",
-            parent=styles["Normal"],
-            fontSize=9,
-            textColor=colors.grey,
-            spaceAfter=12,
-        )
-
-        elements = []
-        elements.append(Paragraph("SOUL 3.0 Library Report", title_style))
-        elements.append(Paragraph(f"<b>Question:</b> {question}", sub_style))
-        elements.append(Paragraph(
-            f"<b>Generated:</b> {time.strftime('%d-%m-%Y %H:%M:%S')}  |  "
-            f"<b>Rows:</b> {len(df)}",
-            sub_style,
-        ))
-        elements.append(Spacer(1, 10))
-
-        # Build table data with header
-        col_headers = [str(c) for c in df.columns]
-        table_data = [col_headers]
-        for _, row in df.iterrows():
-            row_vals = []
-            for v in row.tolist():
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    row_vals.append("")
-                elif isinstance(v, (pd.Timestamp,)):
-                    row_vals.append(v.strftime("%d-%m-%Y %H:%M"))
-                else:
-                    s = str(v)
-                    # Truncate very long cells for PDF readability
-                    if len(s) > 80:
-                        s = s[:77] + "..."
-                    row_vals.append(s)
-            table_data.append(row_vals)
-
-        # Dynamically compute column widths (cap to page width)
-        page_width = landscape(A4)[0] - 60
-        n_cols = max(len(col_headers), 1)
-        col_width = min(page_width / n_cols, 3 * inch)
-        col_widths = [col_width] * n_cols
-
-        table = Table(table_data, repeatRows=1, colWidths=col_widths)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a5276")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8f9fa")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef2f7")]),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ]))
-
-        elements.append(table)
-        doc.build(elements)
-
-        return FileResponse(
-            path=tmp_path,
-            media_type="application/pdf",
-            filename=f"library_report_{report_id[:8]}.pdf",
-        )
-    except Exception as e:
-        print(f"[PDF ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
-
-@app.get("/report/{report_id}/status")
-def report_status(report_id: str):
-    """Optional endpoint: check if a report_id is still valid."""
-    rdata = get_report(report_id)
-    if not rdata:
-        return {"valid": False, "detail": "Report not found or expired."}
-    elapsed = time.time() - rdata["created_at"]
-    remaining = max(0, REPORT_TTL_SECONDS - elapsed)
-    return {
-        "valid": True,
-        "rows": len(rdata["data"]),
-        "question": rdata["question"],
-        "remaining_seconds": int(remaining),
-    }
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7698)

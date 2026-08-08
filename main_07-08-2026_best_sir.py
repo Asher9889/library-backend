@@ -4,37 +4,24 @@ import re
 import ast
 import io
 import base64
-import uuid
-import threading
 from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 import pyodbc
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 # Matplotlib for Chart Generation
 import matplotlib
-matplotlib.use('Agg')  # Backend for server
+matplotlib.use('Agg') # Backend for server
 import matplotlib.pyplot as plt
-import tempfile
-import os
 
-# === NEW IMPORTS FOR REPORT DOWNLOAD ===
-import pandas as pd
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.units import inch
-
-# ==========================================
+app = FastAPI()# ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-os.environ["GROQ_API_KEY"] = "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"
+os.environ["GROQ_API_KEY"] = "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"
 
 CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -50,52 +37,6 @@ CONNECTION_STRING = (
 MAX_ROWS = 100  # Chart banane ke liye thode zyada rows chahiye
 MAX_RETRIES = 5
 _conn = None
-
-# ==========================================
-# REPORT STORE (In-Memory with TTL)
-# ==========================================
-REPORT_STORE: Dict[str, Dict[str, Any]] = {}
-REPORT_TTL_SECONDS = 600  # 10 minutes
-REPORT_LOCK = threading.Lock()
-
-
-def cleanup_expired_reports():
-    """Background cleanup of expired reports."""
-    now = time.time()
-    expired = [
-        rid for rid, rdata in REPORT_STORE.items()
-        if now - rdata["created_at"] > REPORT_TTL_SECONDS
-    ]
-    for rid in expired:
-        REPORT_STORE.pop(rid, None)
-    if expired:
-        print(f"[REPORT_STORE] Cleaned up {len(expired)} expired reports.")
-
-
-def store_report(data: List[Dict], question: str, sql: str) -> str:
-    cleanup_expired_reports()
-    report_id = str(uuid.uuid4())
-    with REPORT_LOCK:
-        REPORT_STORE[report_id] = {
-            "data": data,
-            "question": question,
-            "sql": sql,
-            "created_at": time.time(),
-        }
-    print(f"[REPORT_STORE] Stored report_id={report_id} with {len(data)} rows.")
-    return report_id
-
-
-def get_report(report_id: str) -> Optional[Dict[str, Any]]:
-    with REPORT_LOCK:
-        rdata = REPORT_STORE.get(report_id)
-        if not rdata:
-            return None
-        if time.time() - rdata["created_at"] > REPORT_TTL_SECONDS:
-            REPORT_STORE.pop(report_id, None)
-            return None
-        return rdata
-
 
 # 2. DATABASE CONNECTION & QUERY EXECUTION
 # ==========================================
@@ -226,7 +167,7 @@ MARC TAG DICTIONARY (Exact for this DB):
 ==============================
 SECTION 2: CRITICAL DATA TYPES & JOIN RULES (MUST FOLLOW)
 ==============================
-- `t_issue.acc_no`, `t_receive.accn_no`, `t_book_transfer.acc_no`, `t_replace.old_accco` are **char** with TRAILING SPACES (e.g., '121613     ').
+- `t_issue.acc_no`, `t_receive.accn_no`, `t_book_transfer.acc_no`, `t_replace.old_accno` are **char** with TRAILING SPACES (e.g., '121613     ').
 - `Location.p852` is **nvarchar** WITHOUT trailing spaces.
 - `m_member.mem_cd` is `char`.
 
@@ -280,10 +221,11 @@ MANDATORY JOIN RULES (Based on DB Architecture):
    `JOIN Biblidetails B ON B.RecID = t_reserve.record_no`
 5. Overdue Books (Issued but NOT in Receive):
    `WHERE t.due_dt < GETDATE() AND NOT EXISTS (SELECT 1 FROM t_receive r WHERE r.accn_no = t.acc_no AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt)`
-6. FULL ISSUE/RETURN HISTORY (For a specific book):
-   To get the complete history of a book (both currently issued and returned), ALWAYS start from `t_issue` and LEFT JOIN `t_receive`. NEVER query only `t_receive` for history, otherwise currently issued books will be missed.
-   `FROM t_issue t LEFT JOIN t_receive r ON RTRIM(r.accn_no) = RTRIM(t.acc_no) AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt`
-
+6. Fetching Returned Books History:
+   DO NOT join `t_receive` to `t_issue` to get book titles. Old issue records might be deleted. 
+   Directly join `t_receive` to `Location` to get the book:
+   `JOIN Location L ON L.p852 = RTRIM(r.accn_no)`
+   Then join to `Biblidetails` for the title.
 ==============================
 SECTION 6: STRICT RULES
 ==============================
@@ -295,31 +237,20 @@ SECTION 6: STRICT RULES
 6. ALWAYS alias selected columns uniquely with `AS`.
 7. NEVER reference backup tables (`_backup`, `weedout`, `_temp`).
 8. For "Top N books", use `SELECT DISTINCT` or `GROUP BY`.
-9. COUNTING ISSUES: When counting how many times a book was issued, DO NOT join `Location` or `Biblidetails` if not strictly necessary, as it may duplicate rows. Just count from `t_issue`.
-   ✅ CORRECT: `SELECT TOP 10 acc_no, COUNT(*) FROM t_issue GROUP BY acc_no`
-10. MEMBER NAME SEARCH LOGIC:
-    - If user provides ONLY FIRST NAME: `WHERE mem_firstnm LIKE '%UNNATI%' OR mem_lstnm LIKE '%UNNATI%'`
-    - If user provides FULL NAME (e.g., "UNNATI SINGH"): ALWAYS use AND condition.
-      `WHERE mem_firstnm LIKE '%UNNATI%' AND mem_lstnm LIKE '%SINGH%'`
-11. TOTAL LIBRARY SIZE: If user asks for "total books in library", use `SELECT COUNT(*) FROM Location`.
-12. AGGREGATE vs DETAIL: If user asks "how many" or "total", return a single scalar number using a subquery.
+9. MEMBER NAME SEARCH LOGIC:
+   - If user provides ONLY FIRST NAME (e.g., "UNNATI"): `WHERE mem_firstnm LIKE '%UNNATI%' OR mem_lstnm LIKE '%UNNATI%'`
+   - If user provides FULL NAME (e.g., "UNNATI SINGH"): ALWAYS use AND condition.
+     `WHERE mem_firstnm LIKE '%UNNATI%' AND mem_lstnm LIKE '%SINGH%'`
+     (OR use: `WHERE (mem_firstnm + ' ' + mem_lstnm) LIKE '%UNNATI SINGH%'`)
+   - NEVER use `OR` between first and last name if the user provided both, otherwise it will fetch thousands of unrelated people.
+10. TOTAL LIBRARY SIZE: If user asks for "total books in library" or "library size", NEVER filter by Status (e.g., avoid `WHERE Status = 'AV'`). Use `SELECT COUNT(*) FROM Location` to get the absolute total physical books.
+11. AGGREGATE vs DETAIL: If user asks "how many" or "total" (e.g., "total kitni computer books hai"), DO NOT group by subject and return a long list. Return a single scalar number using a subquery.
+    Example: SELECT (SELECT COUNT(*) FROM Location) AS Total_Books
+12. AVOID HALLUCINATION: When summarizing data, strictly use the numbers present in the SQL result rows. Do not pick a random row's count and present it as the final total.
 13. SINGLE QUERY RULE: NEVER write multiple SELECT statements in one response. 
+    If the user asks for multiple things (e.g., Member details AND their issue history), 
     ALWAYS combine them into a SINGLE query using `LEFT JOIN` or `UNION ALL`. 
-14. DAILY/MONTHLY TRENDS (ISSUED vs RETURNED):
-    If user asks for "daily issued return count", DO NOT JOIN `t_issue` and `t_receive` directly (it causes duplicates and bad counts). 
-    Instead, query them separately using `UNION ALL` and then group by date.
-    Example:
-    `SELECT Date, SUM(Issued) AS Issued, SUM(Returned) AS Returned FROM (`
-    `  SELECT CAST(iss_dt AS DATE) AS Date, COUNT(*) AS Issued, 0 AS Returned FROM t_issue WHERE iss_dt >= '2024-01-01' GROUP BY CAST(iss_dt AS DATE)`
-    `  UNION ALL`
-    `  SELECT CAST(recv_dt AS DATE) AS Date, 0 AS Issued, COUNT(*) AS Returned FROM t_receive WHERE recv_dt >= '2024-01-01' GROUP BY CAST(recv_dt AS DATE)`
-    `) sub GROUP BY Date ORDER BY Date`
-15. COMPLETE DAILY CIRCULATION FLOW (List of transactions):
-    If user asks for "poora circulation flow", "all transactions of a day", or "us din ka poora data", DO NOT just query `t_issue`. 
-    You MUST fetch BOTH issues and returns for that date using `UNION ALL`. 
-    Add a `Transaction_Type` column to differentiate ('Issue' vs 'Return').
-    IMPORTANT: Keep the exact Date and Time in the `Transaction_Date` column. Do NOT use CAST(... AS DATE).
-
+    The Python database driver can only execute one SELECT statement at a time.
 ==============================
 SECTION 7: COMPLEX QUERY EXAMPLES
 ==============================
@@ -334,19 +265,17 @@ LEFT JOIN Biblidetails A ON A.RecID = B.RecID AND A.Tag = '100' AND A.SbFld = 'a
 LEFT JOIN Location L ON L.RecID = B.RecID
 WHERE B.Tag = '245' AND B.SbFld = 'a'
   AND B.FValue LIKE '%data structure%'
-  AND L.Status = 'AV';
+  AND L.Status = 'AV';  -- 'AV' means Available!
 
---- Example B: COMPLETE Issue/Return History of a Book (INCLUDING CURRENTLY ISSUED) ---
+--- Example B: Member's issue history with book titles ---
 SELECT 
     t.iss_dt AS Issue_Date,
     t.due_dt AS Due_Date,
-    r.recv_dt AS Return_Date,
-    M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name
+    B.FValue AS Book_Title
 FROM t_issue t
-LEFT JOIN t_receive r ON RTRIM(r.accn_no) = RTRIM(t.acc_no) AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt
-JOIN m_member M ON M.mem_cd = RTRIM(t.mem_cd)
-WHERE t.acc_no = '150315'
-ORDER BY t.iss_dt DESC;
+JOIN Location L ON L.p852 = RTRIM(t.acc_no)
+JOIN Biblidetails B ON B.RecID = L.RecID AND B.Tag = '245' AND B.SbFld = 'a'
+WHERE t.mem_cd = 'CCAPCC230001';
 
 --- Example C: Active members from a specific department ---
 SELECT 
@@ -356,75 +285,31 @@ FROM VMember M
 WHERE M.mem_status = 'A' 
   AND M.Fclty_dept_dscr LIKE '%Computer%';
 
---- Example D: Top 10 Most Issued Books (WITHOUT DUPLICATES) ---
-SELECT TOP 10 
-    t.acc_no AS Accession_No, 
-    COUNT(*) AS Issue_Count
-FROM t_issue t
-GROUP BY t.acc_no
-ORDER BY Issue_Count DESC;
-
---- Example E: Daily Issue and Return Count for a Month ---
+--- Example F: Get complete details of a member by their ID ---
 SELECT 
-    Date, 
-    SUM(Issued) AS Issued_Books, 
-    SUM(Returned) AS Returned_Books
-FROM (
-    SELECT CAST(iss_dt AS DATE) AS Date, COUNT(*) AS Issued, 0 AS Returned 
-    FROM t_issue 
-    WHERE iss_dt >= '2026-05-01' AND iss_dt < '2026-06-01'
-    GROUP BY CAST(iss_dt AS DATE)
-    UNION ALL
-    SELECT CAST(recv_dt AS DATE) AS Date, 0 AS Issued, COUNT(*) AS Returned 
-    FROM t_receive 
-    WHERE recv_dt >= '2026-05-01' AND recv_dt < '2026-06-01'
-    GROUP BY CAST(recv_dt AS DATE)
-) sub
-GROUP BY Date
-ORDER BY Date;
+    M.mem_cd AS Member_ID,
+    M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
+    M.Fclty_dept_dscr AS Department,
+    M.mem_email AS Email,
+    M.mem_prmntphone AS Phone,
+    M.mem_status AS Status
+FROM VMember M
+WHERE M.mem_cd = 'UGCABC210047';
 
---- Example F: COMPLETE DAILY CIRCULATION FLOW (Both Issues AND Returns with EXACT DATE & TIME) ---
+--- Example G: Search member by Name and show their current issued books ---
 SELECT 
-    Transaction_Date,
-    Transaction_Type,
-    Member_Name,
-    Book_Title,
-    Author
-FROM (
-    -- 1. Books Issued on that date (with time)
-    SELECT 
-        t.iss_dt AS Transaction_Date,
-        'Issue' AS Transaction_Type,
-        M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
-        B.FValue AS Book_Title,
-        A.FValue AS Author
-    FROM t_issue t
-    JOIN m_member M ON M.mem_cd = RTRIM(t.mem_cd)
-    JOIN Location L ON L.p852 = RTRIM(t.acc_no)
-    JOIN Biblidetails B ON B.RecID = L.RecID AND B.Tag = '245' AND B.SbFld = 'a'
-    LEFT JOIN Biblidetails A ON A.RecID = L.RecID AND A.Tag = '100' AND A.SbFld = 'a'
-    WHERE CAST(t.iss_dt AS DATE) = '2025-05-05'
-
-    UNION ALL
-
-    -- 2. Books Returned on that date (with time)
-    SELECT 
-        r.recv_dt AS Transaction_Date,
-        'Return' AS Transaction_Type,
-        M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
-        B.FValue AS Book_Title,
-        A.FValue AS Author
-    FROM t_receive r
-    JOIN m_member M ON M.mem_cd = RTRIM(r.mem_cd)
-    JOIN Location L ON L.p852 = RTRIM(r.accn_no)
-    JOIN Biblidetails B ON B.RecID = L.RecID AND B.Tag = '245' AND B.SbFld = 'a'
-    LEFT JOIN Biblidetails A ON A.RecID = L.RecID AND A.Tag = '100' AND A.SbFld = 'a'
-    WHERE CAST(r.recv_dt AS DATE) = '2025-05-05'
-) sub
-ORDER BY Transaction_Date, Transaction_Type;
+    M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
+    B.FValue AS Book_Title,
+    t.iss_dt AS Issue_Date,
+    t.due_dt AS Due_Date
+FROM VMember M
+JOIN t_issue t ON RTRIM(t.mem_cd) = M.mem_cd
+JOIN Location L ON L.p852 = RTRIM(t.acc_no)
+JOIN Biblidetails B ON B.RecID = L.RecID AND B.Tag = '245' AND B.SbFld = 'a'
+WHERE M.mem_firstnm LIKE '%UNNATI%' OR M.mem_lstnm LIKE '%UNNATI%';
 
 ==============================
-SECTION 8: CHART GENERATION DATA FORMAT
+SECTION 8: CHART GENERATION DATA FORMAT (STRICT RULE)
 ==============================
 If the user asks for a "report", "graph", "chart", "trend", or "distribution" (e.g., department-wise, subject-wise, monthly), you MUST generate an SQL query that returns EXACTLY two columns named `Label` and `Value`.
 - `Label`: The category or time period (e.g., 'Computer Science', '2024-01').
@@ -436,8 +321,9 @@ Example SQL for Report:
 `SELECT M.Fclty_dept_dscr AS Label, COUNT(*) AS Value FROM VMember M WHERE M.mem_status = 'A' GROUP BY M.Fclty_dept_dscr`
 
 CRITICAL EXCEPTION:
-If the user is just searching, listing, or asking "how many", DO NOT use `Label` and `Value` aliases. Use normal descriptive aliases like `Title`, `Total_Students`, `Department`, `Issued_Books`, `Returned_Books`.
+If the user is just searching, listing, or asking "how many" (e.g., "list 5 books", "how many students in CS", "show details"), DO NOT use `Label` and `Value` aliases. Use normal descriptive aliases like `Title`, `Total_Students`, `Department`.
 """
+
 # ==========================================
 # 4. LANGGRAPH STATE & NODES
 # ==========================================
@@ -446,7 +332,6 @@ class AgentState(TypedDict):
     sql_query: str
     previous_sql: str
     query_result: str
-    report_data: Optional[List[Dict[str, Any]]]   # <-- NEW: raw DB rows preserved
     attempts: int
     error: str
     error_history: List[str]
@@ -496,20 +381,12 @@ def execute_sql_node(state: AgentState):
         data_str = str(result["data"])
         if len(data_str) > 12000:
             data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {result['rows']}]"
-        return {
-            "query_result": data_str,
-            "report_data": result["data"],   # <-- NEW: preserve raw data
-            "error": "",
-        }
+        return {"query_result": data_str, "error": ""}
     else:
         print(f"[DEBUG] SQL ERROR: {result['error']}\n")
         hist = state.get("error_history", [])
         hist.append(result["error"])
-        return {
-            "error": result["error"],
-            "error_history": hist,
-            "report_data": None,
-        }
+        return {"error": result["error"], "error_history": hist}
 
 def check_status_node(state: AgentState):
     if state.get("error"):
@@ -643,9 +520,6 @@ class QueryResponse(BaseModel):
     chart_base64: Optional[str] = None
     attempts: int
     debug_error: Optional[str] = None
-    # ---- NEW FIELDS ----
-    report_available: bool = False
-    report_id: Optional[str] = None
 
 @app.get("/welcome")
 def welcome_api():
@@ -683,8 +557,7 @@ def ask_library_agent(request: QueryRequest):
         "error": "",
         "previous_sql": "",
         "error_history": [],
-        "chart_base64": None,
-        "report_data": None,   # <-- NEW
+        "chart_base64": None
     })
     
     final_answer = final_state.get("query_result", "Agent failed to generate answer.")
@@ -693,192 +566,14 @@ def ask_library_agent(request: QueryRequest):
     db_error = final_state.get("error", None) or None
     chart_b64 = final_state.get("chart_base64", None)
     
-    # ---- NEW: Report generation logic ----
-    report_available = False
-    report_id = None
-    report_data = final_state.get("report_data", None)
-    if report_data and isinstance(report_data, list) and len(report_data) > 0:
-        try:
-            report_id = store_report(
-                data=report_data,
-                question=user_question,
-                sql=executed_sql,
-            )
-            report_available = True
-        except Exception as e:
-            print(f"[REPORT_STORE] Failed to store report: {e}")
-            report_available = False
-    # --------------------------------------
-
     return QueryResponse(
         question=user_question,
         sql_query=executed_sql,
         answer=final_answer,
         chart_base64=chart_b64,
         attempts=final_state.get("attempts", 0),
-        debug_error=db_error,
-        report_available=report_available,
-        report_id=report_id,
+        debug_error=db_error
     )
-
-
-# ==========================================
-# 6. REPORT DOWNLOAD ENDPOINTS (NEW)
-# ==========================================
-@app.get("/report/{report_id}/excel")
-def download_excel(report_id: str):
-    """Download the tabular result as an Excel (.xlsx) file."""
-    rdata = get_report(report_id)
-    if not rdata:
-        raise HTTPException(status_code=404, detail="Report not found or expired.")
-
-    try:
-        df = pd.DataFrame(rdata["data"])
-        # Sanitize NaN/None for cleaner Excel
-        df = df.where(pd.notnull(df), None)
-
-        # Use system's temp directory for cross-platform compatibility
-        tmp_dir = tempfile.gettempdir()
-        tmp_path = os.path.join(tmp_dir, f"report_{report_id}.xlsx")
-        
-        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Report")
-            # Auto-adjust column widths
-            worksheet = writer.sheets["Report"]
-            for col_cells in worksheet.columns:
-                max_length = max(
-                    (len(str(cell.value)) if cell.value is not None else 0)
-                    for cell in col_cells
-                )
-                col_letter = col_cells[0].column_letter
-                worksheet.column_dimensions[col_letter].width = min(max_length + 2, 50)
-
-        return FileResponse(
-            path=tmp_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"library_report_{report_id[:8]}.xlsx",
-        )
-    except Exception as e:
-        print(f"[EXCEL ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
-
-@app.get("/report/{report_id}/pdf")
-def download_pdf(report_id: str):
-    """Download the tabular result as a PDF file."""
-    rdata = get_report(report_id)
-    if not rdata:
-        raise HTTPException(status_code=404, detail="Report not found or expired.")
-
-    try:
-        data = rdata["data"]
-        question = rdata.get("question", "")
-        df = pd.DataFrame(data)
-
-        # Use system's temp directory for cross-platform compatibility
-        tmp_dir = tempfile.gettempdir()
-        tmp_path = os.path.join(tmp_dir, f"report_{report_id}.pdf")
-        
-        doc = SimpleDocTemplate(
-            tmp_path,
-            pagesize=landscape(A4),
-            rightMargin=30, leftMargin=30,
-            topMargin=30, bottomMargin=30,
-        )
-
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            "CustomTitle",
-            parent=styles["Title"],
-            fontSize=16,
-            textColor=colors.HexColor("#1a5276"),
-            spaceAfter=6,
-        )
-        sub_style = ParagraphStyle(
-            "CustomSub",
-            parent=styles["Normal"],
-            fontSize=9,
-            textColor=colors.grey,
-            spaceAfter=12,
-        )
-
-        elements = []
-        elements.append(Paragraph("SOUL 3.0 Library Report", title_style))
-        elements.append(Paragraph(f"<b>Question:</b> {question}", sub_style))
-        elements.append(Paragraph(
-            f"<b>Generated:</b> {time.strftime('%d-%m-%Y %H:%M:%S')}  |  "
-            f"<b>Rows:</b> {len(df)}",
-            sub_style,
-        ))
-        elements.append(Spacer(1, 10))
-
-        # Build table data with header
-        col_headers = [str(c) for c in df.columns]
-        table_data = [col_headers]
-        for _, row in df.iterrows():
-            row_vals = []
-            for v in row.tolist():
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    row_vals.append("")
-                elif isinstance(v, (pd.Timestamp,)):
-                    row_vals.append(v.strftime("%d-%m-%Y %H:%M"))
-                else:
-                    s = str(v)
-                    # Truncate very long cells for PDF readability
-                    if len(s) > 80:
-                        s = s[:77] + "..."
-                    row_vals.append(s)
-            table_data.append(row_vals)
-
-        # Dynamically compute column widths (cap to page width)
-        page_width = landscape(A4)[0] - 60
-        n_cols = max(len(col_headers), 1)
-        col_width = min(page_width / n_cols, 3 * inch)
-        col_widths = [col_width] * n_cols
-
-        table = Table(table_data, repeatRows=1, colWidths=col_widths)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a5276")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8f9fa")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef2f7")]),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ]))
-
-        elements.append(table)
-        doc.build(elements)
-
-        return FileResponse(
-            path=tmp_path,
-            media_type="application/pdf",
-            filename=f"library_report_{report_id[:8]}.pdf",
-        )
-    except Exception as e:
-        print(f"[PDF ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
-
-@app.get("/report/{report_id}/status")
-def report_status(report_id: str):
-    """Optional endpoint: check if a report_id is still valid."""
-    rdata = get_report(report_id)
-    if not rdata:
-        return {"valid": False, "detail": "Report not found or expired."}
-    elapsed = time.time() - rdata["created_at"]
-    remaining = max(0, REPORT_TTL_SECONDS - elapsed)
-    return {
-        "valid": True,
-        "rows": len(rdata["data"]),
-        "question": rdata["question"],
-        "remaining_seconds": int(remaining),
-    }
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7698)
