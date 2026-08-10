@@ -8,7 +8,7 @@ import uuid
 import threading
 from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
-from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 import pyodbc
 from fastapi import FastAPI, HTTPException
@@ -34,7 +34,9 @@ from reportlab.lib.units import inch
 # ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-os.environ["GROQ_API_KEY"] = "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"
+# --- LOCAL GPU LLM (Ollama, OpenAI-compatible endpoint) ---
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:32b")
 
 CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -457,7 +459,13 @@ class AgentState(TypedDict):
     error_history: List[str]
     chart_base64: Optional[str]
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+# --- LOCAL GPU LLM via Ollama (OpenAI-compatible endpoint) ---
+llm = ChatOpenAI(
+    base_url=OLLAMA_BASE_URL,
+    api_key="ollama",  # Ollama doesn't check this, but the client requires a value
+    model=OLLAMA_MODEL,
+    temperature=0,
+)
 
 def generate_sql_node(state: AgentState):
     print("---GENERATING SQL---")
