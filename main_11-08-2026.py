@@ -21,9 +21,10 @@ import matplotlib
 matplotlib.use('Agg')  # Backend for server
 import matplotlib.pyplot as plt
 import tempfile
+import os
 from langgraph.checkpoint.memory import MemorySaver
 
-# === REPORT DOWNLOAD ===
+# === NEW IMPORTS FOR REPORT DOWNLOAD ===
 import pandas as pd
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -36,10 +37,8 @@ checkpointer = MemorySaver()
 # ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-# NOTE: Move these to real environment variables / a secrets manager before
-# deploying. Hardcoded DB + API credentials in source is a security risk,
-# especially since this file will end up in git history / logs.
-os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
+
+os.environ["GROQ_API_KEY"] = "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"
 
 CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -52,21 +51,20 @@ CONNECTION_STRING = (
     "Connection Timeout=30;"
 )
 
-MAX_ROWS = 100
+MAX_ROWS = 100  
 MAX_RETRIES = 5
-MAX_HISTORY_TURNS = 6          # how many past Q/A turns to keep in memory
-RESOLVER_CONTEXT_TURNS = 4     # how many of those to actually show the resolver
 _conn = None
 
 # ==========================================
 # REPORT STORE (In-Memory with TTL)
 # ==========================================
 REPORT_STORE: Dict[str, Dict[str, Any]] = {}
-REPORT_TTL_SECONDS = 600  # 10 minutes+
+REPORT_TTL_SECONDS = 600  # 10 minutes
 REPORT_LOCK = threading.Lock()
 
 
 def cleanup_expired_reports():
+    """Background cleanup of expired reports."""
     now = time.time()
     expired = [
         rid for rid, rdata in REPORT_STORE.items()
@@ -103,7 +101,6 @@ def get_report(report_id: str) -> Optional[Dict[str, Any]]:
         return rdata
 
 
-# ==========================================
 # 2. DATABASE CONNECTION & QUERY EXECUTION
 # ==========================================
 BACKUP_TABLE_PATTERNS = [
@@ -141,17 +138,18 @@ def get_connection():
 def validate_query(query: str):
     if not query or not query.strip():
         raise ValueError("Empty SQL")
-
+    
     forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER",
                  "TRUNCATE", "MERGE", "GRANT", "REVOKE", "EXEC", "EXECUTE"]
     for word in forbidden:
         if re.search(rf"\b{word}\b", query, re.IGNORECASE):
             raise ValueError(f"Unsafe query detected: {word}")
-
+            
     stripped = query.strip().lower()
     if not (stripped.startswith("select") or stripped.startswith("with")):
         raise ValueError("Only SELECT/WITH allowed")
 
+    # Block backup tables
     for pat in BACKUP_TABLE_PATTERNS:
         if re.search(pat, query, re.IGNORECASE):
             raise ValueError(f"Query references backup/temp table (pattern: {pat}). Use only live tables.")
@@ -166,18 +164,18 @@ def execute_query(query, limit=True):
             cursor.execute("SELECT 1")
             time.sleep(0.1)
             cursor.execute(query)
-
+            
             if not cursor.description:
                 return []
-
+                
             columns = [col[0] for col in cursor.description]
             rows = cursor.fetchall()
             results = [{col: row[i] for i, col in enumerate(columns)} for row in rows]
-
+            
             if limit and MAX_ROWS and len(results) > MAX_ROWS:
                 results = results[:MAX_ROWS]
             return results
-
+            
         except Exception as e:
             error_msg = str(e)
             print(f"DB Error (attempt {attempt+1}): {error_msg}")
@@ -202,94 +200,6 @@ def run_sql(query, limit=True):
         return {"success": True, "rows": len(results), "data": results}
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-
-# ==========================================
-# 2b. LIVE SCHEMA LOOKUP (fixes hallucinated column/table names on retry)
-# ==========================================
-# Without this, when the LLM writes a column that doesn't exist (e.g.
-# 'mem_fathername', 'mem_joindt'), all it gets back is "Invalid column name X"
-# with no hint of what the REAL column is called — so on retry it just
-# guesses a different wrong name, over and over, until MAX_RETRIES is
-# exhausted. These helpers fetch the actual schema from SQL Server itself so
-# the retry prompt can give the model ground truth instead of a blank error.
-SCHEMA_CACHE: Dict[str, List[str]] = {}
-SCHEMA_CACHE_LOCK = threading.Lock()
-
-_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-
-def extract_table_names(sql: str) -> List[str]:
-    """Crude but effective: grab identifiers that follow FROM / JOIN."""
-    raw = re.findall(r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.]*)', sql, re.IGNORECASE)
-    names = []
-    for r in raw:
-        name = r.split('.')[-1]  # strip schema prefix like dbo.
-        if _IDENTIFIER_RE.match(name) and name not in names:
-            names.append(name)
-    return names
-
-def get_table_columns(table_name: str) -> List[str]:
-    """Live INFORMATION_SCHEMA lookup, cached in-process."""
-    if not _IDENTIFIER_RE.match(table_name):
-        return []
-    with SCHEMA_CACHE_LOCK:
-        cached = SCHEMA_CACHE.get(table_name)
-    if cached is not None:
-        return cached
-    try:
-        query = (
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-            f"WHERE TABLE_NAME = '{table_name}' ORDER BY ORDINAL_POSITION"
-        )
-        results = execute_query(query, limit=False)
-        cols = [r["COLUMN_NAME"] for r in results]
-        with SCHEMA_CACHE_LOCK:
-            SCHEMA_CACHE[table_name] = cols
-        return cols
-    except Exception as e:
-        print(f"[SCHEMA] Could not fetch columns for {table_name}: {e}")
-        return []
-
-def find_similar_table_names(fragment: str) -> List[str]:
-    """Used when the bad identifier is a TABLE/VIEW name, not a column."""
-    safe_fragment = re.sub(r'[^A-Za-z0-9_]', '', fragment)[:60]
-    if not safe_fragment:
-        return []
-    try:
-        query = (
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-            f"WHERE TABLE_NAME LIKE '%{safe_fragment}%'"
-        )
-        results = execute_query(query, limit=False)
-        return [r["TABLE_NAME"] for r in results][:10]
-    except Exception as e:
-        print(f"[SCHEMA] Could not search similar table names: {e}")
-        return []
-
-def build_schema_error_hint(sql: str, error_msg: str) -> str:
-    """
-    Given a failed SQL query and the SQL Server error it produced, build a
-    short ground-truth block to feed back into the retry prompt: real column
-    lists for the tables actually used, and/or close table-name matches if
-    the failure was an unknown table/view.
-    """
-    hints = []
-    lower_err = error_msg.lower()
-
-    if "invalid column name" in lower_err:
-        for t in extract_table_names(sql):
-            cols = get_table_columns(t)
-            if cols:
-                hints.append(f"{t}: {', '.join(cols)}")
-
-    obj_match = re.search(r"Invalid object name '([^']+)'", error_msg, re.IGNORECASE)
-    if obj_match:
-        bad_name = obj_match.group(1).split('.')[-1]
-        matches = find_similar_table_names(bad_name)
-        if matches:
-            hints.append(f"No table/view called '{bad_name}'. Closest real names: {', '.join(matches)}")
-
-    return "\n".join(hints)
 
 
 # ==========================================
@@ -335,8 +245,8 @@ SECTION 3: EXACT STATUS / ENUM CODES (CRITICAL FOR FILTERS)
 - `Location.Status` = **'AV'** (Available). Use `WHERE L.Status = 'AV'` for available books.
 - `m_member.mem_status` = **'A'** (Active).
 - `t_book_transfer.Status` = **'T'** (Transferred), **'R'** (Returned)
-- `t_receive.recv_status` = **EMPTY STRING ' ' or NULL**.
-  🚨 CRITICAL: DO NOT use `WHERE recv_status = 'R'`.
+- `t_receive.recv_status` = **EMPTY STRING ' ' or NULL**. 
+  🚨 CRITICAL: DO NOT use `WHERE recv_status = 'R'`. 
   To check if a book is returned, check if it EXISTS in `t_receive`:
   `EXISTS (SELECT 1 FROM t_receive r WHERE r.accn_no = t.acc_no AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt)`
 
@@ -364,9 +274,9 @@ SECTION 5: SCHEMA MAP & EXACT RELATIONSHIPS (VERIFIED)
 **Biblidetails**: RecID, Tag ('245'=Title, '100'=Author, '653'=Subject), SbFld ('a'), FValue
 
 MANDATORY JOIN RULES (Based on DB Architecture):
-1. Member to ANY table (Issue/Receive/Fine/Reserve):
+1. Member to ANY table (Issue/Receive/Fine/Reserve): 
    `JOIN m_member M ON M.mem_cd = RTRIM(t.mem_cd)`
-2. Accession No (acc_no / accn_no) to Location:
+2. Accession No (acc_no / accn_no) to Location: 
    `JOIN Location L ON L.p852 = RTRIM(t.acc_no)`  -- (DO NOT join acc_no to RecID)
 3. Location to Book Catalog (Metadata):
    `JOIN Biblidetails B ON B.RecID = L.RecID`
@@ -397,10 +307,10 @@ SECTION 6: STRICT RULES
       `WHERE mem_firstnm LIKE '%UNNATI%' AND mem_lstnm LIKE '%SINGH%'`
 11. TOTAL LIBRARY SIZE: If user asks for "total books in library", use `SELECT COUNT(*) FROM Location`.
 12. AGGREGATE vs DETAIL: If user asks "how many" or "total", return a single scalar number using a subquery.
-13. SINGLE QUERY RULE: NEVER write multiple SELECT statements in one response.
-    ALWAYS combine them into a SINGLE query using `LEFT JOIN` or `UNION ALL`.
+13. SINGLE QUERY RULE: NEVER write multiple SELECT statements in one response. 
+    ALWAYS combine them into a SINGLE query using `LEFT JOIN` or `UNION ALL`. 
 14. DAILY/MONTHLY TRENDS (ISSUED vs RETURNED):
-    If user asks for "daily issued return count", DO NOT JOIN `t_issue` and `t_receive` directly (it causes duplicates and bad counts).
+    If user asks for "daily issued return count", DO NOT JOIN `t_issue` and `t_receive` directly (it causes duplicates and bad counts). 
     Instead, query them separately using `UNION ALL` and then group by date.
     Example:
     `SELECT Date, SUM(Issued) AS Issued, SUM(Returned) AS Returned FROM (`
@@ -409,8 +319,8 @@ SECTION 6: STRICT RULES
     `  SELECT CAST(recv_dt AS DATE) AS Date, 0 AS Issued, COUNT(*) AS Returned FROM t_receive WHERE recv_dt >= '2024-01-01' GROUP BY CAST(recv_dt AS DATE)`
     `) sub GROUP BY Date ORDER BY Date`
 15. COMPLETE DAILY CIRCULATION FLOW (List of transactions):
-    If user asks for "poora circulation flow", "all transactions of a day", or "us din ka poora data", DO NOT just query `t_issue`.
-    You MUST fetch BOTH issues and returns for that date using `UNION ALL`.
+    If user asks for "poora circulation flow", "all transactions of a day", or "us din ka poora data", DO NOT just query `t_issue`. 
+    You MUST fetch BOTH issues and returns for that date using `UNION ALL`. 
     Add a `Transaction_Type` column to differentiate ('Issue' vs 'Return').
     IMPORTANT: Keep the exact Date and Time in the `Transaction_Date` column. Do NOT use CAST(... AS DATE).
 16. EXACT ID LOOKUPS (CRITICAL):
@@ -424,7 +334,7 @@ SECTION 7: COMPLEX QUERY EXAMPLES
 ==============================
 
 --- Example A: Find available books by title ---
-SELECT
+SELECT 
     B.FValue AS Title,
     A.FValue AS Author,
     L.p852 AS Accession_No
@@ -436,7 +346,7 @@ WHERE B.Tag = '245' AND B.SbFld = 'a'
   AND L.Status = 'AV';
 
 --- Example B: COMPLETE Issue/Return History of a Book (INCLUDING CURRENTLY ISSUED) ---
-SELECT
+SELECT 
     t.iss_dt AS Issue_Date,
     t.due_dt AS Due_Date,
     r.recv_dt AS Return_Date,
@@ -448,34 +358,34 @@ WHERE RTRIM(t.acc_no) = '150315'
 ORDER BY t.iss_dt DESC;
 
 --- Example C: Active members from a specific department ---
-SELECT
-    M.mem_cd,
+SELECT 
+    M.mem_cd, 
     M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name
 FROM VMember M
-WHERE M.mem_status = 'A'
+WHERE M.mem_status = 'A' 
   AND M.Fclty_dept_dscr LIKE '%Computer%';
 
 --- Example D: Top 10 Most Issued Books (WITHOUT DUPLICATES) ---
-SELECT TOP 10
-    t.acc_no AS Accession_No,
+SELECT TOP 10 
+    t.acc_no AS Accession_No, 
     COUNT(*) AS Issue_Count
 FROM t_issue t
 GROUP BY t.acc_no
 ORDER BY Issue_Count DESC;
 
 --- Example E: Daily Issue and Return Count for a Month ---
-SELECT
-    Date,
-    SUM(Issued) AS Issued_Books,
+SELECT 
+    Date, 
+    SUM(Issued) AS Issued_Books, 
     SUM(Returned) AS Returned_Books
 FROM (
-    SELECT CAST(iss_dt AS DATE) AS Date, COUNT(*) AS Issued, 0 AS Returned
-    FROM t_issue
+    SELECT CAST(iss_dt AS DATE) AS Date, COUNT(*) AS Issued, 0 AS Returned 
+    FROM t_issue 
     WHERE iss_dt >= '2026-05-01' AND iss_dt < '2026-06-01'
     GROUP BY CAST(iss_dt AS DATE)
     UNION ALL
-    SELECT CAST(recv_dt AS DATE) AS Date, 0 AS Issued, COUNT(*) AS Returned
-    FROM t_receive
+    SELECT CAST(recv_dt AS DATE) AS Date, 0 AS Issued, COUNT(*) AS Returned 
+    FROM t_receive 
     WHERE recv_dt >= '2026-05-01' AND recv_dt < '2026-06-01'
     GROUP BY CAST(recv_dt AS DATE)
 ) sub
@@ -483,7 +393,7 @@ GROUP BY Date
 ORDER BY Date;
 
 --- Example F: COMPLETE DAILY CIRCULATION FLOW (Both Issues AND Returns with EXACT DATE & TIME) ---
-SELECT
+SELECT 
     Transaction_Date,
     Transaction_Type,
     Member_Name,
@@ -491,7 +401,7 @@ SELECT
     Author
 FROM (
     -- 1. Books Issued on that date (with time)
-    SELECT
+    SELECT 
         t.iss_dt AS Transaction_Date,
         'Issue' AS Transaction_Type,
         M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
@@ -507,7 +417,7 @@ FROM (
     UNION ALL
 
     -- 2. Books Returned on that date (with time)
-    SELECT
+    SELECT 
         r.recv_dt AS Transaction_Date,
         'Return' AS Transaction_Type,
         M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
@@ -537,126 +447,40 @@ Example SQL for Report:
 CRITICAL EXCEPTION:
 If the user is just searching, listing, or asking "how many", DO NOT use `Label` and `Value` aliases. Use normal descriptive aliases like `Title`, `Total_Students`, `Department`, `Issued_Books`, `Returned_Books`.
 """
-
-# ==========================================
-# 3b. FOLLOW-UP RESOLVER PROMPT
-# ==========================================
-FOLLOWUP_RESOLVER_PROMPT = """You are a query-rewriting module for a Library Management System chatbot.
-Your ONLY job is to look at the conversation history and the user's CURRENT question, and decide whether the
-current question is a follow-up that depends on context from earlier turns (pronouns, "unke", "unka", "uska",
-"usme se", "iski", "unhe", "in members ka", "list them", "and their emails", "wapas", "usne", "ismein",
-"pichle wale", implicit topic continuation, etc.).
-
-RULES:
-1. If there is NO conversation history, OR the current question is already fully standalone (it names its own
-   subject/entity and does not rely on anything from earlier turns), output the question EXACTLY AS-IS, with no
-   changes.
-2. If the current question DOES depend on earlier context, rewrite it into one fully standalone question by
-   substituting in the specific entity/topic/filter from the conversation history (e.g. the department, the
-   member name, the book title, the date range, the previous result set being referred to).
-3. NEVER answer the question. NEVER add SQL. ONLY output the rewritten natural-language question.
-4. Preserve the original language style of the CURRENT question (Hindi / English / Hinglish) — do not translate it.
-5. Do not invent facts that aren't implied by the history. Keep the rewrite concise and faithful.
-6. Output ONLY the rewritten question text. No quotes, no markdown, no explanation, no prefix like "Rewritten:".
-
-CONVERSATION HISTORY (oldest to newest):
-{history}
-
-CURRENT QUESTION:
-{question}
-
-Rewritten standalone question:"""
-
 # ==========================================
 # 4. LANGGRAPH STATE & NODES
 # ==========================================
-class ChatTurn(TypedDict):
-    question: str
-    answer: str
-
 class AgentState(TypedDict):
-    question: str                       # raw question as typed by the user this turn
-    resolved_question: str              # standalone version used for SQL generation
+    question: str
     sql_query: str
     previous_sql: str
     query_result: str
-    report_data: Optional[List[Dict[str, Any]]]
+    report_data: Optional[List[Dict[str, Any]]]   # <-- NEW: raw DB rows preserved
     attempts: int
     error: str
     error_history: List[str]
-    schema_hint: str                    # live ground-truth schema for tables in the failed query
     chart_base64: Optional[str]
-    chat_history: List[ChatTurn]        # persisted across turns via the checkpointer
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-
-
-def resolve_followup_node(state: AgentState):
-    """
-    Reads chat_history (carried forward automatically by MemorySaver for this
-    thread_id) and decides whether state['question'] is a standalone question
-    or a follow-up that needs to be rewritten using prior context.
-    """
-    print("---RESOLVING FOLLOW-UP---")
-    question = state["question"]
-    history: List[ChatTurn] = state.get("chat_history", []) or []
-
-    if not history:
-        print("[RESOLVER] No history yet -> treating as standalone.")
-        return {"resolved_question": question}
-
-    recent = history[-RESOLVER_CONTEXT_TURNS:]
-    history_text = "\n".join(
-        f"Q: {h['question']}\nA: {h['answer']}" for h in recent
-    )
-
-    prompt = FOLLOWUP_RESOLVER_PROMPT.format(history=history_text, question=question)
-
-    try:
-        response = llm.invoke([HumanMessage(content=prompt)])
-        resolved = (response.content or "").strip().strip('"').strip("'").strip()
-        if not resolved:
-            resolved = question
-    except Exception as e:
-        print(f"[RESOLVER ERROR] Falling back to raw question: {e}")
-        resolved = question
-
-    print(f"[RESOLVER] Original : {question}")
-    print(f"[RESOLVER] Resolved : {resolved}")
-
-    return {"resolved_question": resolved}
-
 
 def generate_sql_node(state: AgentState):
     print("---GENERATING SQL---")
     prev_err = state.get("error", "")
     prev_sql = state.get("previous_sql", "")
     err_hist = state.get("error_history", [])
-    schema_hint = state.get("schema_hint", "")
-
-    # Always generate SQL from the RESOLVED (standalone) question, not the raw one.
-    active_question = state.get("resolved_question") or state["question"]
 
     if prev_err:
-        schema_block = (
-            f"ACTUAL LIVE DATABASE SCHEMA for the table(s) you used, fetched just now from "
-            f"INFORMATION_SCHEMA — this is GROUND TRUTH. Use ONLY these exact names. "
-            f"Do NOT invent, assume, or guess any column or table name not listed here:\n{schema_hint}\n\n"
-            if schema_hint else ""
-        )
         user_msg = (
-            f"User Question: {active_question}\n\n"
+            f"User Question: {state['question']}\n\n"
             f"Your PREVIOUS SQL (which FAILED):\n{prev_sql}\n\n"
             f"ERROR returned by SQL Server:\n{prev_err}\n\n"
             f"All errors so far: {err_hist}\n\n"
-            f"{schema_block}"
-            f"Fix the SQL using the real schema above if provided. Re-think the JOINs and column names. "
-            f"Remember the RTRIM and Status='AV' rules. "
+            f"Fix the SQL. Re-think the JOINs and column names. Remember the RTRIM and Status='AV' rules. "
             f"Output ONLY the SQL without any markdown."
         )
     else:
         user_msg = (
-            f"User Question: {active_question}\n\n"
+            f"User Question: {state['question']}\n\n"
             f"Generate the T-SQL query. Output ONLY the SQL without any markdown."
         )
 
@@ -683,28 +507,17 @@ def execute_sql_node(state: AgentState):
             data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {result['rows']}]"
         return {
             "query_result": data_str,
-            "report_data": result["data"],
+            "report_data": result["data"],   # <-- NEW: preserve raw data
             "error": "",
-            "schema_hint": "",
         }
     else:
         print(f"[DEBUG] SQL ERROR: {result['error']}\n")
         hist = state.get("error_history", [])
         hist.append(result["error"])
-
-        schema_hint = ""
-        try:
-            schema_hint = build_schema_error_hint(clean_sql, result["error"])
-            if schema_hint:
-                print(f"[SCHEMA] Ground-truth hint for retry:\n{schema_hint}\n")
-        except Exception as e:
-            print(f"[SCHEMA] Hint lookup failed, continuing without it: {e}")
-
         return {
             "error": result["error"],
             "error_history": hist,
             "report_data": None,
-            "schema_hint": schema_hint,
         }
 
 def check_status_node(state: AgentState):
@@ -719,19 +532,22 @@ def check_status_node(state: AgentState):
         return "generate_chart"
 
 def generate_chart_node(state: AgentState):
+    """Node to automatically generate chart if data has Label & Value"""
     print("---CHECKING FOR CHART DATA---")
     data_str = state.get("query_result", "[]")
     chart_b64 = None
-
+    
     try:
         data = ast.literal_eval(data_str)
+        # Agar data me 'Label' aur 'Value' columns hain, toh chart banao
         if len(data) > 1 and "Label" in data[0] and "Value" in data[0]:
             print("---GENERATING CHART---")
             labels = [d["Label"] for d in data]
             values = [d["Value"] for d in data]
-
+            
             plt.figure(figsize=(10, 5))
-
+            
+            # Agar 6 ya usse kam items hain toh Pie chart, warna Line chart
             if len(data) <= 6:
                 plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
                 plt.axis('equal')
@@ -745,36 +561,37 @@ def generate_chart_node(state: AgentState):
                 plt.xticks(rotation=45)
                 plt.grid(True, linestyle='--', alpha=0.7)
                 plt.tight_layout()
-
+            
+            # Chart ko Base64 me convert karna
             buf = io.BytesIO()
             plt.savefig(buf, format='png')
             plt.close()
             buf.seek(0)
             chart_b64 = base64.b64encode(buf.read()).decode('utf-8')
-
+            
     except Exception as e:
         print(f"Chart generation skipped: {e}")
-
+        
     return {"chart_base64": chart_b64}
 
 def generate_answer_node(state: AgentState):
     print("---GENERATING FINAL ANSWER---")
-
+    
     chart_note = ""
     if state.get("chart_base64"):
         chart_note = "A chart has been generated and attached for this data. Mention this in your response."
 
+    # ---> Exact row count calculate karna <---
     row_count_note = ""
     data_str = state.get("query_result", "[]")
     try:
+        # Data string ko list mein convert karke uska length nikalna
         actual_data = ast.literal_eval(data_str)
         if isinstance(actual_data, list):
             row_count = len(actual_data)
             row_count_note = f"\nIMPORTANT: The SQL query returned exactly {row_count} rows. If the user asks 'how many' or for a count, you MUST use this exact number ({row_count}) and do not guess or count manually."
     except Exception as e:
         print(f"Could not calculate row count for LLM: {e}")
-
-    active_question = state.get("resolved_question") or state["question"]
 
     messages = [
         SystemMessage(content=f"""You are a helpful, professional library assistant. Based on the user's question and the SQL query result, give a clear, highly accurate, and perfectly formatted answer.
@@ -800,8 +617,7 @@ LANGUAGE & FORMATTING RULES:
    - Do not change, remove, or invent any database values.
    - If the result has only a single value/count and is not a table, do NOT add S.No.
 {chart_note}"""),
-        HumanMessage(content=f"User Question (as originally typed): {state['question']}\n\n"
-                              f"Resolved standalone question used for SQL: {active_question}\n\n"
+        HumanMessage(content=f"User Question: {state['question']}\n\n"
                               f"Executed SQL:\n{state.get('sql_query','')}\n\n"
                               f"SQL Result Data:\n{state['query_result']}\n\n"
                               f"{row_count_note}\n\n"
@@ -809,61 +625,36 @@ LANGUAGE & FORMATTING RULES:
     ]
     response = llm.invoke(messages)
     return {"query_result": response.content}
-
-
-def update_memory_node(state: AgentState):
-    """
-    Appends this turn (raw question + final formatted answer) to chat_history
-    and trims it to the last MAX_HISTORY_TURNS turns. Because this state field
-    is checkpointed per thread_id, it will be available to resolve_followup_node
-    on the NEXT call for the same thread_id.
-    """
-    print("---UPDATING CONVERSATION MEMORY---")
-    history: List[ChatTurn] = state.get("chat_history", []) or []
-    history = history + [{
-        "question": state["question"],
-        "answer": state.get("query_result", ""),
-    }]
-    if len(history) > MAX_HISTORY_TURNS:
-        history = history[-MAX_HISTORY_TURNS:]
-    return {"chat_history": history}
-
-
 # Compile Graph
 workflow = StateGraph(AgentState)
-workflow.add_node("resolve_followup", resolve_followup_node)
 workflow.add_node("generate_sql", generate_sql_node)
 workflow.add_node("execute_sql", execute_sql_node)
 workflow.add_node("generate_chart", generate_chart_node)
 workflow.add_node("generate_answer", generate_answer_node)
-workflow.add_node("update_memory", update_memory_node)
 
-workflow.set_entry_point("resolve_followup")
-workflow.add_edge("resolve_followup", "generate_sql")
+workflow.set_entry_point("generate_sql")
 workflow.add_edge("generate_sql", "execute_sql")
 workflow.add_conditional_edges(
     "execute_sql",
     check_status_node,
     {
-        "retry_generate": "generate_sql",
-        END: END,
-        "generate_chart": "generate_chart"
+        "retry_generate": "generate_sql", 
+        END: END,                         
+        "generate_chart": "generate_chart" 
     }
 )
 workflow.add_edge("generate_chart", "generate_answer")
-workflow.add_edge("generate_answer", "update_memory")
-workflow.add_edge("update_memory", END)
+workflow.add_edge("generate_answer", END)
 
-library_agent = workflow.compile(
-    checkpointer=checkpointer
-)
+library_agent = workflow.compile()
+
 
 # ==========================================
 # 5. FASTAPI APP SETUP
 # ==========================================
 app = FastAPI(
     title="SOUL30 Library Text-to-SQL API",
-    version="3.1"
+    version="3.0"
 )
 
 app.add_middleware(
@@ -876,21 +667,23 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     question: str
-    thread_id: str
 
 class QueryResponse(BaseModel):
     question: str
-    resolved_question: str
     sql_query: str
     answer: str
     chart_base64: Optional[str] = None
     attempts: int
     debug_error: Optional[str] = None
+    # ---- NEW FIELDS ----
     report_available: bool = False
     report_id: Optional[str] = None
 
 @app.get("/welcome")
 def welcome_api():
+    """
+    Returns 10 sample complex questions to test the AI Agent capabilities.
+    """
     return {
         "message": "Welcome to the SOUL 3.0 Library AI Assistant! Here are 10 complex questions you can ask to test the system:",
         "sample_questions": [
@@ -909,43 +702,30 @@ def welcome_api():
 
 @app.get("/")
 def read_root():
-    return {"status": "SOUL30 Library Text-to-SQL API v3.1 (with follow-up memory) is running perfectly!"}
+    return {"status": "SOUL30 Library Text-to-SQL API v3.0 is running perfectly!"}
 
 @app.post("/ask", response_model=QueryResponse)
 def ask_library_agent(request: QueryRequest):
     user_question = request.question
     print(f"\n[API] User Question: {user_question}\n")
-
-    # IMPORTANT: we intentionally do NOT pass "chat_history" here.
-    # LangGraph's checkpointer will merge this input with the last checkpoint
-    # for this thread_id, so any existing chat_history carries forward
-    # automatically. Only on a brand-new thread_id will it start as [].
-    final_state = library_agent.invoke(
-        {
-            "question": user_question,
-            "resolved_question": "",
-            "attempts": 0,
-            "error": "",
-            "previous_sql": "",
-            "error_history": [],
-            "schema_hint": "",
-            "chart_base64": None,
-            "report_data": None,
-        },
-        config={
-            "configurable": {
-                "thread_id": request.thread_id
-            }
-        }
-    )
-
+    
+    final_state = library_agent.invoke({
+        "question": user_question,
+        "attempts": 0,
+        "error": "",
+        "previous_sql": "",
+        "error_history": [],
+        "chart_base64": None,
+        "report_data": None,   # <-- NEW
+    })
+    
     final_answer = final_state.get("query_result", "Agent failed to generate answer.")
     executed_sql = (final_state.get("sql_query", "")
                     .replace("```sql", "").replace("```", "").strip())
     db_error = final_state.get("error", None) or None
     chart_b64 = final_state.get("chart_base64", None)
-    resolved_q = final_state.get("resolved_question", "") or user_question
-
+    
+    # ---- NEW: Report generation logic ----
     report_available = False
     report_id = None
     report_data = final_state.get("report_data", None)
@@ -960,10 +740,10 @@ def ask_library_agent(request: QueryRequest):
         except Exception as e:
             print(f"[REPORT_STORE] Failed to store report: {e}")
             report_available = False
+    # --------------------------------------
 
     return QueryResponse(
         question=user_question,
-        resolved_question=resolved_q,
         sql_query=executed_sql,
         answer=final_answer,
         chart_base64=chart_b64,
@@ -974,41 +754,28 @@ def ask_library_agent(request: QueryRequest):
     )
 
 
-@app.post("/reset-memory/{thread_id}")
-def reset_memory(thread_id: str):
-    """
-    Clears conversation memory for a given thread_id by writing an empty
-    chat_history into the checkpoint. Call this when the user starts a
-    brand-new chat session in the frontend, so old context doesn't leak in.
-    """
-    try:
-        library_agent.update_state(
-            config={"configurable": {"thread_id": thread_id}},
-            values={"chat_history": []},
-        )
-        return {"status": "ok", "detail": f"Memory cleared for thread_id={thread_id}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not reset memory: {e}")
-
-
 # ==========================================
-# 6. REPORT DOWNLOAD ENDPOINTS
+# 6. REPORT DOWNLOAD ENDPOINTS (NEW)
 # ==========================================
 @app.get("/report/{report_id}/excel")
 def download_excel(report_id: str):
+    """Download the tabular result as an Excel (.xlsx) file."""
     rdata = get_report(report_id)
     if not rdata:
         raise HTTPException(status_code=404, detail="Report not found or expired.")
 
     try:
         df = pd.DataFrame(rdata["data"])
+        # Sanitize NaN/None for cleaner Excel
         df = df.where(pd.notnull(df), None)
 
+        # Use system's temp directory for cross-platform compatibility
         tmp_dir = tempfile.gettempdir()
         tmp_path = os.path.join(tmp_dir, f"report_{report_id}.xlsx")
-
+        
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Report")
+            # Auto-adjust column widths
             worksheet = writer.sheets["Report"]
             for col_cells in worksheet.columns:
                 max_length = max(
@@ -1029,6 +796,7 @@ def download_excel(report_id: str):
 
 @app.get("/report/{report_id}/pdf")
 def download_pdf(report_id: str):
+    """Download the tabular result as a PDF file."""
     rdata = get_report(report_id)
     if not rdata:
         raise HTTPException(status_code=404, detail="Report not found or expired.")
@@ -1038,9 +806,10 @@ def download_pdf(report_id: str):
         question = rdata.get("question", "")
         df = pd.DataFrame(data)
 
+        # Use system's temp directory for cross-platform compatibility
         tmp_dir = tempfile.gettempdir()
         tmp_path = os.path.join(tmp_dir, f"report_{report_id}.pdf")
-
+        
         doc = SimpleDocTemplate(
             tmp_path,
             pagesize=landscape(A4),
@@ -1074,6 +843,7 @@ def download_pdf(report_id: str):
         ))
         elements.append(Spacer(1, 10))
 
+        # Build table data with header
         col_headers = [str(c) for c in df.columns]
         table_data = [col_headers]
         for _, row in df.iterrows():
@@ -1085,11 +855,13 @@ def download_pdf(report_id: str):
                     row_vals.append(v.strftime("%d-%m-%Y %H:%M"))
                 else:
                     s = str(v)
+                    # Truncate very long cells for PDF readability
                     if len(s) > 80:
                         s = s[:77] + "..."
                     row_vals.append(s)
             table_data.append(row_vals)
 
+        # Dynamically compute column widths (cap to page width)
         page_width = landscape(A4)[0] - 60
         n_cols = max(len(col_headers), 1)
         col_width = min(page_width / n_cols, 3 * inch)
@@ -1126,6 +898,7 @@ def download_pdf(report_id: str):
 
 @app.get("/report/{report_id}/status")
 def report_status(report_id: str):
+    """Optional endpoint: check if a report_id is still valid."""
     rdata = get_report(report_id)
     if not rdata:
         return {"valid": False, "detail": "Report not found or expired."}
