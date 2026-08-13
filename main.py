@@ -5,7 +5,9 @@ import ast
 import io
 import base64
 import uuid
+import json
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
@@ -32,6 +34,12 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.units import inch
 
 checkpointer = MemorySaver()
+
+# ==========================================
+# LIVEKIT VOICE AGENT (imported lazily-safe helpers)
+# ==========================================
+from livekit_agent.config import settings as lk_settings
+from livekit_agent.tokens import create_join_token, dispatch_agent, generate_room_name
 
 # ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
@@ -889,6 +897,49 @@ class QueryResponse(BaseModel):
     report_available: bool = False
     report_id: Optional[str] = None
 
+
+# ==========================================
+# LIVEKIT VOICE SESSION MODELS
+# ==========================================
+class LiveKitSessionRequest(BaseModel):
+    """Request to start a voice chat session with the LiveKit agent.
+
+    The backend generates the room + join token and (optionally) dispatches the
+    agent, so the client only has to connect with ``url`` + ``token``.
+    """
+    room: Optional[str] = None          # optional; a fresh room is created if omitted
+    identity: Optional[str] = None      # optional; defaults to a generated identity
+    user_id: Optional[str] = None       # passed to the agent as dispatch metadata
+    thread_id: Optional[str] = None     # conversation memory key for follow-ups
+    metadata: Optional[Dict[str, Any]] = None  # extra metadata forwarded to the agent
+    dispatch: bool = True               # spawn the agent for this session
+
+
+class LiveKitDispatchRequest(BaseModel):
+    """Explicitly dispatch the agent into an existing room via the server API."""
+    room: str
+    user_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class LiveKitResponse(BaseModel):
+    url: str
+    token: str
+    room: str
+    identity: str
+    agent_name: str
+    ttl_seconds: int
+    expires_at: str
+    dispatch: str  # "token" | "api" | "none"
+
+
+class LiveKitDispatchResponse(BaseModel):
+    room: str
+    agent_name: str
+    dispatch_id: Optional[str] = None
+    dispatch: str  # "api" | "token" | "none"
+
 @app.get("/welcome")
 def welcome_api():
     return {
@@ -989,6 +1040,127 @@ def reset_memory(thread_id: str):
         return {"status": "ok", "detail": f"Memory cleared for thread_id={thread_id}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not reset memory: {e}")
+
+
+# ==========================================
+# 5b. LIVEKIT VOICE AGENT ENDPOINTS
+# ==========================================
+def _build_session_response(
+    room: str,
+    identity: str,
+    dispatch_method: str,
+    dispatch_metadata: Optional[Dict[str, Any]],
+) -> LiveKitResponse:
+    token = create_join_token(
+        room=room,
+        identity=identity,
+        name=identity,
+        dispatch_metadata=dispatch_metadata,
+        ttl_seconds=lk_settings.token_ttl_seconds,
+    )
+    expires = datetime.now(timezone.utc) + timedelta(seconds=lk_settings.token_ttl_seconds)
+    return LiveKitResponse(
+        url=lk_settings.livekit_url,
+        token=token,
+        room=room,
+        identity=identity,
+        agent_name=lk_settings.agent_name,
+        ttl_seconds=lk_settings.token_ttl_seconds,
+        expires_at=expires.isoformat(),
+        dispatch=dispatch_method,
+    )
+
+
+@app.get("/api/livekit/config")
+def livekit_config():
+    """Public, safe client config (no secrets)."""
+    return {
+        "url": lk_settings.livekit_url,
+        "agent_name": lk_settings.agent_name,
+        "token_ttl_seconds": lk_settings.token_ttl_seconds,
+        "tts_language": lk_settings.tts_language,
+    }
+
+
+@app.post("/api/livekit/session", response_model=LiveKitResponse)
+def livekit_session(request: LiveKitSessionRequest):
+    """
+    The main entry point for the web client.
+
+    Generates a fresh room (unless one is provided), issues a join token that
+    carries the agent dispatch, and spawns the LiveKit agent. The client then
+    connects to ``url`` with ``token`` and the voice conversation begins.
+
+    Use a fresh session (no room) per voice chat so the agent is dispatched on
+    room creation. Pass ``thread_id`` to keep follow-up memory in the library
+    text-to-SQL backend, and ``user_id`` for analytics.
+    """
+    room = request.room or generate_room_name("soul")
+    identity = request.identity or f"user-{uuid.uuid4().hex[:10]}"
+
+    dispatch_metadata = dict(request.metadata or {})
+    if request.user_id:
+        dispatch_metadata["user_id"] = request.user_id
+    if request.thread_id:
+        dispatch_metadata["thread_id"] = request.thread_id
+    dispatch_metadata.setdefault("session_id", uuid.uuid4().hex[:16])
+
+    dispatch_method = "none"
+    if request.dispatch:
+        try:
+            dispatch_metadata["room"] = room
+            dispatch_metadata["identity"] = identity
+            # The token's room config dispatches the agent the instant the
+            # client connects and creates the room.
+            dispatch_method = "token"
+            return _build_session_response(room, identity, dispatch_method, dispatch_metadata)
+        except Exception as e:
+            print(f"[LIVEKIT] Could not attach token dispatch: {e}")
+            raise HTTPException(status_code=500, detail=f"LiveKit dispatch failed: {e}")
+
+    return _build_session_response(room, identity, dispatch_method, None)
+
+
+@app.post("/api/livekit/token", response_model=LiveKitResponse)
+def livekit_token(request: LiveKitSessionRequest):
+    """
+    Plain join token without automatic agent dispatch. Use when the room
+    already exists or the agent is dispatched separately via /api/livekit/dispatch.
+    """
+    room = request.room or generate_room_name("soul")
+    identity = request.identity or f"user-{uuid.uuid4().hex[:10]}"
+    return _build_session_response(room, identity, "none", None)
+
+
+@app.post("/api/livekit/dispatch", response_model=LiveKitDispatchResponse)
+async def livekit_dispatch(request: LiveKitDispatchRequest):
+    """
+    Explicitly spawn the agent into an existing room via the LiveKit server
+    API (AgentDispatchService). Falls back to a token room-config dispatch
+    warning if the HTTP API is unreachable.
+    """
+    dispatch_metadata = dict(request.metadata or {})
+    if request.user_id:
+        dispatch_metadata["user_id"] = request.user_id
+    if request.thread_id:
+        dispatch_metadata["thread_id"] = request.thread_id
+
+    try:
+        dispatch_id = await dispatch_agent(request.room, dispatch_metadata)
+        return LiveKitDispatchResponse(
+            room=request.room,
+            agent_name=lk_settings.agent_name,
+            dispatch_id=dispatch_id,
+            dispatch="api",
+        )
+    except Exception as e:
+        print(f"[LIVEKIT] AgentDispatchService unavailable ({e}); using token dispatch instead.")
+        return LiveKitDispatchResponse(
+            room=request.room,
+            agent_name=lk_settings.agent_name,
+            dispatch_id=None,
+            dispatch="token",
+        )
 
 
 # ==========================================
