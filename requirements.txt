@@ -1,0 +1,13 @@
+livekit-agents
+uvicorn
+langgraph
+langchain_groq
+pyodbc
+fastapi
+matplotlib
+pandas
+dotenv
+livekit-plugins-silero
+livekit-plugins-groq
+reportlab
+livekit-plugins-dtln

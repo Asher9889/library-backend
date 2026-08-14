@@ -25,6 +25,11 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_bool(name: str, default: bool = True) -> bool:
+    val = _get(name, "1" if default else "0").lower()
+    return val in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Settings:
     livekit_url: str
@@ -34,6 +39,7 @@ class Settings:
     agent_name: str
     agent_deployment: str
     agent_display_name: str
+    agent_logs: bool
     groq_api_key: str
     groq_model: str
     stt_url: str
@@ -55,6 +61,7 @@ settings = Settings(
     agent_name=_get("LIVEKIT_AGENT_NAME", "soul-library-voice-assistant"),
     agent_deployment=_get("LIVEKIT_AGENT_DEPLOYMENT", ""),
     agent_display_name=_get("LIVEKIT_AGENT_DISPLAY_NAME", "SOUL Library Assistant"),
+    agent_logs=_get_bool("LIVEKIT_AGENT_LOGS", True),
     groq_api_key=_get("GROQ_API_KEY"),
     groq_model=_get("GROQ_MODEL", "llama-3.3-70b-versatile"),
     stt_url=_get("STT_URL", "http://localhost:8000").rstrip("/"),

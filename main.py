@@ -13,6 +13,7 @@ from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 import pyodbc
+import groq
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -49,12 +50,35 @@ from livekit_agent.tokens import create_join_token, dispatch_agent, generate_roo
 # especially since this file will end up in git history / logs.
 os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
 
+
+def _resolve_odbc_driver() -> str:
+    """Pick a SQL Server ODBC driver that actually exists on this machine.
+
+    Prefers the driver named by ``DB_DRIVER`` (default: the Microsoft driver,
+    used in production). Falls back to the Homebrew FreeTDS driver when the
+    Microsoft driver is not installed (e.g. dev Macs).
+    """
+    requested = os.environ.get("DB_DRIVER", "ODBC Driver 17 for SQL Server")
+    available = set(pyodbc.drivers())
+    if requested in available:
+        return requested
+    if "FreeTDS" in available:
+        print(f"[DB] Driver {requested!r} not installed; falling back to FreeTDS")
+        return "FreeTDS"
+    raise RuntimeError(
+        "No SQL Server ODBC driver available. Install one (e.g. msodbcsql17) "
+        f"or set DB_DRIVER. Found drivers: {sorted(available)}"
+    )
+
+
+DB_DRIVER = _resolve_odbc_driver()
+
 CONNECTION_STRING = (
-    "Driver={ODBC Driver 17 for SQL Server};"
-    "Server=160.25.62.109,1433;"
-    "Database=SOUL30;"
-    "UID=sa;"
-    "PWD=msspl@123;"
+    f"Driver={{{DB_DRIVER}}};"
+    f"Server={os.environ.get('DB_SERVER', '160.25.62.109,1433')};"
+    f"Database={os.environ.get('DB_DATABASE', 'SOUL30')};"
+    f"UID={os.environ.get('DB_USER', 'sa')};"
+    f"PWD={os.environ.get('DB_PASSWORD', 'msspl@123')};"
     "Encrypt=no;"
     "TrustServerCertificate=yes;"
     "Connection Timeout=30;"
@@ -971,24 +995,42 @@ def ask_library_agent(request: QueryRequest):
     # LangGraph's checkpointer will merge this input with the last checkpoint
     # for this thread_id, so any existing chat_history carries forward
     # automatically. Only on a brand-new thread_id will it start as [].
-    final_state = library_agent.invoke(
-        {
-            "question": user_question,
-            "resolved_question": "",
-            "attempts": 0,
-            "error": "",
-            "previous_sql": "",
-            "error_history": [],
-            "schema_hint": "",
-            "chart_base64": None,
-            "report_data": None,
-        },
-        config={
-            "configurable": {
-                "thread_id": request.thread_id
+    try:
+        final_state = library_agent.invoke(
+            {
+                "question": user_question,
+                "resolved_question": "",
+                "attempts": 0,
+                "error": "",
+                "previous_sql": "",
+                "error_history": [],
+                "schema_hint": "",
+                "chart_base64": None,
+                "report_data": None,
+            },
+            config={
+                "configurable": {
+                    "thread_id": request.thread_id
+                }
             }
-        }
-    )
+        )
+    except groq.RateLimitError as e:
+        # Shared GROQ key hit its tokens-per-minute limit. Return a graceful,
+        # friendly answer instead of a 500 so the caller (web UI or voice
+        # agent) can surface a "try again shortly" message.
+        print(f"[API] GROQ RATE LIMIT EXCEEDED: {e}")
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="सिस्टम अभी बहुत व्यस्त है, कृपया थोड़ी देर बाद फिर पूछें। "
+                   "The system is busy right now, please try again in a moment.",
+            attempts=1,
+            debug_error=f"Rate limit exceeded: {e}",
+        )
+    except Exception as e:
+        print(f"[API] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Library agent failed: {e}")
 
     final_answer = final_state.get("query_result", "Agent failed to generate answer.")
     executed_sql = (final_state.get("sql_query", "")
