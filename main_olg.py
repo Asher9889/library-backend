@@ -239,6 +239,12 @@ def run_sql(query, limit=True):
 # ==========================================
 # 2b. LIVE SCHEMA LOOKUP (fixes hallucinated column/table names on retry)
 # ==========================================
+# Without this, when the LLM writes a column that doesn't exist (e.g.
+# 'mem_fathername', 'mem_joindt'), all it gets back is "Invalid column name X"
+# with no hint of what the REAL column is called — so on retry it just
+# guesses a different wrong name, over and over, until MAX_RETRIES is
+# exhausted. These helpers fetch the actual schema from SQL Server itself so
+# the retry prompt can give the model ground truth instead of a blank error.
 SCHEMA_CACHE: Dict[str, List[str]] = {}
 SCHEMA_CACHE_LOCK = threading.Lock()
 
@@ -444,10 +450,6 @@ SECTION 6: STRICT RULES
     ✅ CORRECT: `WHERE RTRIM(mem_cd) = 'DPDCDC160001'`
     ✅ CORRECT: `WHERE mem_cd LIKE 'DPDCDC160001%'`
     ❌ WRONG: `WHERE mem_cd = 'DPDCDC160001'`
-17. USER ACCESS CONTROL (CRITICAL):
-    Agar question ke shuru mein "[STRICT ACCESS CONTROL: ...]" block diya ho, toh SQL query mein ALWAYS uss specific `mem_cd` ka filter lagana.
-    Example: `WHERE RTRIM(mem_cd) = 'CCAPCC230009'`
-    Kisi bhi dusre member ka data query mat karna. Agar user general question pooche (jaise "library me kitni books hain") jisme mem_cd filter zaroori nahi, toh usme mat lagana.
 
 ==============================
 SECTION 7: COMPLEX QUERY EXAMPLES
@@ -904,66 +906,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# RFID AUTHENTICATION MODELS & ENDPOINT
-# ==========================================
-class RfidAuthRequest(BaseModel):
-    rfid: str
-
-class RfidAuthResponse(BaseModel):
-    success: bool
-    mem_cd: Optional[str] = None
-    member_name: Optional[str] = None
-    message: str
-
-@app.post("/auth/rfid", response_model=RfidAuthResponse)
-def rfid_auth(request: RfidAuthRequest):
-    """
-    Kiosk RFID scan karta hai -> backend mem_cd nikaalta hai.
-    """
-    rfid = (request.rfid or "").strip()
-    if not rfid:
-        return RfidAuthResponse(success=False, message="RFID khali hai")
-
-    try:
-        query = f"SELECT R.mem_cd, M.mem_firstnm, M.mem_lstnm FROM m_memberRfid R LEFT JOIN m_member M ON M.mem_cd = RTRIM(R.mem_cd) WHERE R.Rfid = '{rfid}'"
-        results = execute_query(query, limit=False)
-    except Exception as e:
-        return RfidAuthResponse(success=False, message=f"DB Error: {e}")
-
-    if not results:
-        return RfidAuthResponse(success=False, message="Yeh RFID kisi member se mapped nahi hai")
-
-    mem_cd = (results[0].get("mem_cd") or "").strip()
-    first_nm = (results[0].get("mem_firstnm") or "").strip()
-    last_nm = (results[0].get("mem_lstnm") or "").strip()
-    
-    return RfidAuthResponse(
-        success=True,
-        mem_cd=mem_cd,
-        member_name=f"{first_nm} {last_nm}".strip(),
-        message="Login successful"
-    )
-
-# ==========================================
-# ASK ENDPOINT MODELS & LOGIC
-# ==========================================
 class QueryRequest(BaseModel):
     question: str
     thread_id: str
-    mem_cd: Optional[str] = None  # <-- Naya field add kiya
+    user_role: str = "admin"          # "admin" ya "member"
+    mem_cd: Optional[str] = None      # jab user_role == "member", uska unique mem_cd
 
-class QueryResponse(BaseModel):
+
+class AgentState(TypedDict):
     question: str
     resolved_question: str
     sql_query: str
-    answer: str
-    chart_base64: Optional[str] = None
+    previous_sql: str
+    query_result: str
+    report_data: Optional[List[Dict[str, Any]]]
     attempts: int
-    debug_error: Optional[str] = None
-    report_available: bool = False
-    report_id: Optional[str] = None
-
+    error: str
+    error_history: List[str]
+    schema_hint: str
+    chart_base64: Optional[str]
+    chat_history: List[ChatTurn]
+    user_role: str          # NEW
+    mem_cd: Optional[str]   # NEW
 
 # ==========================================
 # LIVEKIT VOICE SESSION MODELS
@@ -1032,29 +996,16 @@ def read_root():
 @app.post("/ask", response_model=QueryResponse)
 def ask_library_agent(request: QueryRequest):
     user_question = request.question
-    mem_cd = (request.mem_cd or "").strip()
-    
-    # ---- IDENTITY INJECTION ----
-    # Agar mem_cd aaya hai, toh LLM ko strict instruction do ki sirf iska data nikale
-    if mem_cd:
-        active_question = (
-            f"[STRICT ACCESS CONTROL: The logged-in user's mem_cd is '{mem_cd}'. "
-            f"You MUST filter all personal data (issues, returns, fines, member details) by this exact mem_cd. "
-            f"Always use WHERE RTRIM(mem_cd) = '{mem_cd}'. "
-            f"DO NOT show any other member's data under any circumstances.]\n\n"
-            f"User Question: {user_question}"
-        )
-    else:
-        # Agar koi mem_cd nahi bheja (general query)
-        active_question = user_question
+    print(f"\n[API] User Question: {user_question}\n")
 
-    print(f"\n[API] mem_cd={mem_cd} Q={user_question}\n")
-
+    # IMPORTANT: we intentionally do NOT pass "chat_history" here.
+    # LangGraph's checkpointer will merge this input with the last checkpoint
+    # for this thread_id, so any existing chat_history carries forward
+    # automatically. Only on a brand-new thread_id will it start as [].
     try:
         final_state = library_agent.invoke(
             {
-                # Yahan hum active_question bhej rahe hain (jo context ke saath modified hai)
-                "question": active_question,   
+                "question": user_question,
                 "resolved_question": "",
                 "attempts": 0,
                 "error": "",
@@ -1071,6 +1022,9 @@ def ask_library_agent(request: QueryRequest):
             }
         )
     except groq.RateLimitError as e:
+        # Shared GROQ key hit its tokens-per-minute limit. Return a graceful,
+        # friendly answer instead of a 500 so the caller (web UI or voice
+        # agent) can surface a "try again shortly" message.
         print(f"[API] GROQ RATE LIMIT EXCEEDED: {e}")
         return QueryResponse(
             question=user_question,
@@ -1091,26 +1045,6 @@ def ask_library_agent(request: QueryRequest):
     db_error = final_state.get("error", None) or None
     chart_b64 = final_state.get("chart_base64", None)
     resolved_q = final_state.get("resolved_question", "") or user_question
-
-    # ---- SAFETY NET (Defense in Depth) ----
-    # Agar LLM ne bhool kar bhi kisi aur ka data nikalne ki koshish ki, toh yahan block karo
-    if mem_cd:
-        sql_lower = executed_sql.lower()
-        # Check karo ki SQL mein user ka mem_cd hai ya nahi
-        if mem_cd.lower() not in sql_lower:
-            sensitive_tables = ["m_member", "t_issue", "t_receive", "t_reserve", "t_memfine", "vmember", "vcmpltissuedetails"]
-            # Agar SQL in tables ko touch kar raha hai aur mem_cd missing hai, toh leak ho sakta hai
-            if any(table in sql_lower for table in sensitive_tables):
-                return QueryResponse(
-                    question=user_question,
-                    resolved_question="",
-                    sql_query="",
-                    answer="🔒 Aap sirf apna data dekh sakte hain. Yeh query access nahi ki ja sakti.",
-                    attempts=final_state.get("attempts", 0),
-                    debug_error="Blocked: Missing mem_cd filter",
-                    report_available=False,
-                    report_id=None
-                )
 
     report_available = False
     report_id = None

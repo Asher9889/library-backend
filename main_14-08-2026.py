@@ -3,82 +3,54 @@ import time
 import re
 import ast
 import io
+import json
 import base64
 import uuid
-import json
 import threading
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import datetime
 from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 import pyodbc
-import groq
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
-# Matplotlib for Chart Generation
 import matplotlib
-matplotlib.use('Agg')  # Backend for server
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import tempfile
 from langgraph.checkpoint.memory import MemorySaver
 
-# === REPORT DOWNLOAD ===
 import pandas as pd
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.units import inch
+
+from openpyxl.drawing.image import Image as OpenpyxlImage
+from openpyxl.utils import get_column_letter
+
+import requests
+import edge_tts
 
 checkpointer = MemorySaver()
 
 # ==========================================
-# LIVEKIT VOICE AGENT (imported lazily-safe helpers)
-# ==========================================
-from livekit_agent.config import settings as lk_settings
-from livekit_agent.tokens import create_join_token, dispatch_agent, generate_room_name
-
-# ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-# NOTE: Move these to real environment variables / a secrets manager before
-# deploying. Hardcoded DB + API credentials in source is a security risk,
-# especially since this file will end up in git history / logs.
-os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
-
-
-def _resolve_odbc_driver() -> str:
-    """Pick a SQL Server ODBC driver that actually exists on this machine.
-
-    Prefers the driver named by ``DB_DRIVER`` (default: the Microsoft driver,
-    used in production). Falls back to the Homebrew FreeTDS driver when the
-    Microsoft driver is not installed (e.g. dev Macs).
-    """
-    requested = os.environ.get("DB_DRIVER", "ODBC Driver 17 for SQL Server")
-    available = set(pyodbc.drivers())
-    if requested in available:
-        return requested
-    if "FreeTDS" in available:
-        print(f"[DB] Driver {requested!r} not installed; falling back to FreeTDS")
-        return "FreeTDS"
-    raise RuntimeError(
-        "No SQL Server ODBC driver available. Install one (e.g. msodbcsql17) "
-        f"or set DB_DRIVER. Found drivers: {sorted(available)}"
-    )
-
-
-DB_DRIVER = _resolve_odbc_driver()
+os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
 
 CONNECTION_STRING = (
-    f"Driver={{{DB_DRIVER}}};"
-    f"Server={os.environ.get('DB_SERVER', '160.25.62.109,1433')};"
-    f"Database={os.environ.get('DB_DATABASE', 'SOUL30')};"
-    f"UID={os.environ.get('DB_USER', 'sa')};"
-    f"PWD={os.environ.get('DB_PASSWORD', 'msspl@123')};"
+    "Driver={ODBC Driver 17 for SQL Server};"
+    "Server=160.25.62.109,1433;"
+    "Database=SOUL30;"
+    "UID=sa;"
+    "PWD=msspl@123;"
     "Encrypt=no;"
     "TrustServerCertificate=yes;"
     "Connection Timeout=30;"
@@ -86,15 +58,23 @@ CONNECTION_STRING = (
 
 MAX_ROWS = 100
 MAX_RETRIES = 5
-MAX_HISTORY_TURNS = 6          # how many past Q/A turns to keep in memory
-RESOLVER_CONTEXT_TURNS = 4     # how many of those to actually show the resolver
+MAX_HISTORY_TURNS = 6
+RESOLVER_CONTEXT_TURNS = 4
 _conn = None
 
+STT_BASE_URL = "https://stt-server.mssplonline.in"
+STT_TRANSCRIBE_FILE_URL = f"{STT_BASE_URL}/transcribe"
+STT_TRANSCRIBE_PCM_URL = f"{STT_BASE_URL}/transcribe-pcm"
+STT_HEALTH_URL = f"{STT_BASE_URL}/v1/stt/health"
+STT_LANGUAGE = None
+
+TTS_VOICE = "hi-IN-MadhurNeural"
+
 # ==========================================
-# REPORT STORE (In-Memory with TTL)
+# REPORT STORE
 # ==========================================
 REPORT_STORE: Dict[str, Dict[str, Any]] = {}
-REPORT_TTL_SECONDS = 600  # 10 minutes+
+REPORT_TTL_SECONDS = 600
 REPORT_LOCK = threading.Lock()
 
 
@@ -143,8 +123,14 @@ BACKUP_TABLE_PATTERNS = [
     r"WO_\d+_Backup", r"NewWeedout", r"WeedoutBooks", r"_copy$"
 ]
 
+ALLOWED_TEMP_TABLES = {"m_member_temp"}
+
+BINARY_COLUMNS = {"member_photo", "member_sign", "member_receipt"}
+
 def is_backup_table(name: str) -> bool:
     lname = name.lower()
+    if lname in {t.lower() for t in ALLOWED_TEMP_TABLES}:
+        return False
     for pat in BACKUP_TABLE_PATTERNS:
         if re.search(pat, lname):
             return True
@@ -184,9 +170,33 @@ def validate_query(query: str):
     if not (stripped.startswith("select") or stripped.startswith("with")):
         raise ValueError("Only SELECT/WITH allowed")
 
-    for pat in BACKUP_TABLE_PATTERNS:
-        if re.search(pat, query, re.IGNORECASE):
-            raise ValueError(f"Query references backup/temp table (pattern: {pat}). Use only live tables.")
+    try:
+        table_names = extract_table_names(query)
+    except Exception:
+        table_names = []
+
+    for t in table_names:
+        for pat in BACKUP_TABLE_PATTERNS:
+            if re.search(pat, t, re.IGNORECASE):
+                if t.lower() not in {a.lower() for a in ALLOWED_TEMP_TABLES}:
+                    raise ValueError(
+                        f"Query references backup/temp table: '{t}'. "
+                        f"Only live tables or allowed temp tables are permitted."
+                    )
+
+
+def _convert_value(val, col_name: str = ""):
+    """Convert a database value to a JSON-serialisable Python type.
+    Binary/image columns are converted to base64 data URIs."""
+    if val is None:
+        return None
+    if isinstance(val, bytes):
+        b64 = base64.b64encode(val).decode('utf-8')
+        return f"data:image/jpeg;base64,{b64}"
+    if isinstance(val, datetime):
+        return val.strftime('%Y-%m-%d %H:%M:%S')
+    return val
+
 
 def execute_query(query, limit=True):
     global _conn
@@ -204,7 +214,12 @@ def execute_query(query, limit=True):
 
             columns = [col[0] for col in cursor.description]
             rows = cursor.fetchall()
-            results = [{col: row[i] for i, col in enumerate(columns)} for row in rows]
+            results = []
+            for row in rows:
+                row_dict = {}
+                for i, col in enumerate(columns):
+                    row_dict[col] = _convert_value(row[i], col)
+                results.append(row_dict)
 
             if limit and MAX_ROWS and len(results) > MAX_ROWS:
                 results = results[:MAX_ROWS]
@@ -237,7 +252,7 @@ def run_sql(query, limit=True):
 
 
 # ==========================================
-# 2b. LIVE SCHEMA LOOKUP (fixes hallucinated column/table names on retry)
+# 2b. LIVE SCHEMA LOOKUP
 # ==========================================
 SCHEMA_CACHE: Dict[str, List[str]] = {}
 SCHEMA_CACHE_LOCK = threading.Lock()
@@ -245,17 +260,15 @@ SCHEMA_CACHE_LOCK = threading.Lock()
 _IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 def extract_table_names(sql: str) -> List[str]:
-    """Crude but effective: grab identifiers that follow FROM / JOIN."""
     raw = re.findall(r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.]*)', sql, re.IGNORECASE)
     names = []
     for r in raw:
-        name = r.split('.')[-1]  # strip schema prefix like dbo.
+        name = r.split('.')[-1]
         if _IDENTIFIER_RE.match(name) and name not in names:
             names.append(name)
     return names
 
 def get_table_columns(table_name: str) -> List[str]:
-    """Live INFORMATION_SCHEMA lookup, cached in-process."""
     if not _IDENTIFIER_RE.match(table_name):
         return []
     with SCHEMA_CACHE_LOCK:
@@ -277,7 +290,6 @@ def get_table_columns(table_name: str) -> List[str]:
         return []
 
 def find_similar_table_names(fragment: str) -> List[str]:
-    """Used when the bad identifier is a TABLE/VIEW name, not a column."""
     safe_fragment = re.sub(r'[^A-Za-z0-9_]', '', fragment)[:60]
     if not safe_fragment:
         return []
@@ -293,12 +305,6 @@ def find_similar_table_names(fragment: str) -> List[str]:
         return []
 
 def build_schema_error_hint(sql: str, error_msg: str) -> str:
-    """
-    Given a failed SQL query and the SQL Server error it produced, build a
-    short ground-truth block to feed back into the retry prompt: real column
-    lists for the tables actually used, and/or close table-name matches if
-    the failure was an unknown table/view.
-    """
     hints = []
     lower_err = error_msg.lower()
 
@@ -350,19 +356,18 @@ SECTION 2: CRITICAL DATA TYPES & JOIN RULES (MUST FOLLOW)
 - `Location.p852` is **nvarchar** WITHOUT trailing spaces.
 - `m_member.mem_cd` is `char` WITH TRAILING SPACES.
 
-🚨 MANDATORY JOIN RULE: ALWAYS use `RTRIM()` when joining ANY of these char columns.
-  ✅ CORRECT: `JOIN Location L ON L.p852 = RTRIM(t.acc_no)`
-  ✅ CORRECT: `JOIN Location L ON L.p852 = RTRIM(r.accn_no)`
-  ❌ WRONG:   `JOIN Location L ON L.p852 = t.acc_no`
+MANDATORY JOIN RULE: ALWAYS use `RTRIM()` when joining ANY of these char columns.
+  CORRECT: `JOIN Location L ON L.p852 = RTRIM(t.acc_no)`
+  WRONG:   `JOIN Location L ON L.p852 = t.acc_no`
 
 ==============================
 SECTION 3: EXACT STATUS / ENUM CODES (CRITICAL FOR FILTERS)
 ==============================
-- `Location.Status` = **'AV'** (Available). Use `WHERE L.Status = 'AV'` for available books.
-- `m_member.mem_status` = **'A'** (Active).
-- `t_book_transfer.Status` = **'T'** (Transferred), **'R'** (Returned)
-- `t_receive.recv_status` = **EMPTY STRING ' ' or NULL**.
-  🚨 CRITICAL: DO NOT use `WHERE recv_status = 'R'`.
+- `Location.Status` = 'AV' (Available). Use `WHERE L.Status = 'AV'` for available books.
+- `m_member.mem_status` = 'A' (Active).
+- `t_book_transfer.Status` = 'T' (Transferred), 'R' (Returned)
+- `t_receive.recv_status` = EMPTY STRING ' ' or NULL.
+  CRITICAL: DO NOT use `WHERE recv_status = 'R'`.
   To check if a book is returned, check if it EXISTS in `t_receive`:
   `EXISTS (SELECT 1 FROM t_receive r WHERE r.accn_no = t.acc_no AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt)`
 
@@ -370,10 +375,10 @@ SECTION 3: EXACT STATUS / ENUM CODES (CRITICAL FOR FILTERS)
 SECTION 4: PREFERRED SHORTCUT VIEWS
 ==============================
 USE these views for complex queries instead of writing 5+ JOINs:
-1. **v_BookDetails** — `AccNo, ClassNo, Title, Author, Location, LocId, Department, Status`
-2. **VMember** — `mem_cd, mem_firstnm, mem_lstnm, mem_email, mem_prmntphone, mem_dept, Fclty_dept_dscr (Dept Name), mem_status, mem_ctgry, ctgry_desc, Branch_name`
-3. **VCmpltIssueDetails** — `mem_cd, acc_no, iss_dt, due_dt, FValue (Title), mem_firstnm, mem_lstnm, mem_dept`
-4. **vlocation** — `recID, p852, status, lastoperateddt`
+1. v_BookDetails — AccNo, ClassNo, Title, Author, Location, LocId, Department, Status
+2. VMember — mem_cd, mem_firstnm, mem_lstnm, mem_email, mem_prmntphone, mem_dept, Fclty_dept_dscr (Dept Name), mem_status, mem_ctgry, ctgry_desc, Branch_name
+3. VCmpltIssueDetails — mem_cd, acc_no, iss_dt, due_dt, FValue (Title), mem_firstnm, mem_lstnm, mem_dept
+4. vlocation — recID, p852, status, lastoperateddt
 
 ==============================
 SECTION 5: SCHEMA MAP & EXACT RELATIONSHIPS (VERIFIED)
@@ -389,65 +394,123 @@ SECTION 5: SCHEMA MAP & EXACT RELATIONSHIPS (VERIFIED)
 **Location**: RecID, p852 (Accession No), Status ('AV'), DateofAcq
 **Biblidetails**: RecID, Tag ('245'=Title, '100'=Author, '653'=Subject), SbFld ('a'), FValue
 
-MANDATORY JOIN RULES (Based on DB Architecture):
-1. Member to ANY table (Issue/Receive/Fine/Reserve):
-   `JOIN m_member M ON M.mem_cd = RTRIM(t.mem_cd)`
-2. Accession No (acc_no / accn_no) to Location:
-   `JOIN Location L ON L.p852 = RTRIM(t.acc_no)`  -- (DO NOT join acc_no to RecID)
-3. Location to Book Catalog (Metadata):
-   `JOIN Biblidetails B ON B.RecID = L.RecID`
-4. Reservation to Book Catalog (DIRECT, No Location needed):
-   `JOIN Biblidetails B ON B.RecID = t_reserve.record_no`
-5. Overdue Books (Issued but NOT in Receive):
-   `WHERE t.due_dt < GETDATE() AND NOT EXISTS (SELECT 1 FROM t_receive r WHERE r.accn_no = t.acc_no AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt)`
-6. FULL ISSUE/RETURN HISTORY (For a specific book):
-   To get the complete history of a book (both currently issued and returned), ALWAYS start from `t_issue` and LEFT JOIN `t_receive`. NEVER query only `t_receive` for history, otherwise currently issued books will be missed.
-   `FROM t_issue t LEFT JOIN t_receive r ON RTRIM(r.accn_no) = RTRIM(t.acc_no) AND r.mem_cd = t.mem_cd AND r.iss_dt = t.iss_dt`
+==============================
+SECTION 5B: m_member_temp — EXTENDED MEMBER DETAILS TABLE
+==============================
+The table `m_member_temp` contains FULL member profile data. Use this table whenever the user asks for
+phone, date of birth, signature, photo, address, gender, or any extended member detail.
+
+**m_member_temp columns:**
+- recordid (int, auto-increment primary key)
+- mem_firstnm (first name)
+- mem_lstnm (last name)
+- mem_ctgry (member category code)
+- mem_inst (institute)
+- mem_dept (department code)
+- mem_degree (degree)
+- mem_year (year)
+- mem_status (status: 'A'=Active, 'IA'=Inactive)
+- mem_prmntadd1, mem_prmntadd2 (permanent address lines)
+- mem_prmntcity (permanent city)
+- mem_prmntpin (permanent PIN code)
+- mem_prmntphone (permanent phone number)
+- mem_tmpadd1, mem_tmpadd2 (temporary address lines)
+- mem_tmpcity (temporary city)
+- mem_tmppin (temporary PIN code)
+- mem_tmpphone (temporary phone number)
+- mem_email (email address)
+- mem_id (member ID)
+- remarks
+- date_of_birth (datetime)
+- mem_gender (Male/Female)
+- mem_type (member type, e.g., 'research scholar', 'Faculty')
+- member_photo (BINARY IMAGE — JPEG)
+- member_sign (BINARY IMAGE — JPEG — member's signature)
+- member_receipt (BINARY IMAGE — fee receipt)
+- mem_photo_path (file path for photo)
+- RegDate (registration date)
+- feercptno (fee receipt number)
+- feercptdate (fee receipt date)
+- UpdatedDate (last updated date)
+- mem_hosteladress (hostel address)
+- mem_hostelroomno (hostel room number)
+
+FIELD MAPPING (when user asks for ... → select this column):
+  - Phone number       → mem_prmntphone (permanent) or mem_tmpphone (temporary)
+  - Date of birth / DOB → date_of_birth
+  - Signature           → member_sign (BINARY IMAGE)
+  - Photo               → member_photo (BINARY IMAGE)
+  - Email               → mem_email
+  - Address (permanent) → mem_prmntadd1, mem_prmntadd2, mem_prmntcity, mem_prmntpin
+  - Address (temporary) → mem_tmpadd1, mem_tmpadd2, mem_tmpcity, mem_tmppin
+  - Gender              → mem_gender
+  - Hostel address      → mem_hosteladress, mem_hostelroomno
+  - Category            → mem_ctgry
+  - Degree              → mem_degree
+  - Member type         → mem_type
+  - Fee receipt no      → feercptno
+
+CRITICAL RULES FOR BINARY COLUMNS:
+  1. member_sign, member_photo, member_receipt are BINARY image columns.
+  2. ONLY SELECT them — NEVER use them in WHERE, JOIN, GROUP BY, or ORDER BY clauses.
+  3. When the user asks for a signature or photo, include the member's name alongside the binary column
+     so the response can be properly attributed.
+     CORRECT: SELECT mem_firstnm, mem_lstnm, member_sign FROM m_member_temp WHERE mem_firstnm LIKE '%NAME%'
+  4. Do NOT SELECT * from m_member_temp unless explicitly asked — it returns huge binary blobs.
+     Always select only the specific columns the user asked for.
+
+SEARCHING m_member_temp BY NAME:
+  - If user provides ONLY FIRST NAME:
+    WHERE mem_firstnm LIKE '%UNNATI%' OR mem_lstnm LIKE '%UNNATI%'
+  - If user provides FULL NAME (e.g., "UNNATI SINGH"):
+    WHERE mem_firstnm LIKE '%UNNATI%' AND mem_lstnm LIKE '%SINGH%'
+
+JOINING m_member_temp WITH m_member:
+  JOIN m_member_temp T ON T.mem_firstnm = M.mem_firstnm AND T.mem_lstnm = M.mem_lstnm
+  (or use RTRIM on both sides if there are trailing spaces)
 
 ==============================
 SECTION 6: STRICT RULES
 ==============================
-1. Output ONLY valid T-SQL. No markdown fences (```), no comments, no explanations.
-2. ALWAYS use `RTRIM()` for char↔nvarchar joins.
-3. Start book-search queries `FROM Biblidetails` and LEFT JOIN Location.
-4. Use `LIKE '%...%'` for text search. NEVER use exact `=`.
-5. Use `COUNT(DISTINCT RecID)` for counting books.
-6. ALWAYS alias selected columns uniquely with `AS`.
-7. NEVER reference backup tables (`_backup`, `weedout`, `_temp`).
-8. For "Top N books", use `SELECT DISTINCT` or `GROUP BY`.
-9. COUNTING ISSUES: When counting how many times a book was issued, DO NOT join `Location` or `Biblidetails` if not strictly necessary, as it may duplicate rows. Just count from `t_issue`.
-   ✅ CORRECT: `SELECT TOP 10 acc_no, COUNT(*) FROM t_issue GROUP BY acc_no`
+1. Output ONLY valid T-SQL. No markdown fences, no comments, no explanations.
+2. ALWAYS use RTRIM() for char↔nvarchar joins.
+3. Start book-search queries FROM Biblidetails and LEFT JOIN Location.
+4. Use LIKE '%...%' for text search. NEVER use exact =.
+5. Use COUNT(DISTINCT RecID) for counting books.
+6. ALWAYS alias selected columns uniquely with AS.
+7. NEVER reference backup tables (_backup, weedout, _copy). m_member_temp IS ALLOWED.
+8. For "Top N books", use SELECT DISTINCT or GROUP BY.
+9. COUNTING ISSUES: When counting how many times a book was issued, DO NOT join Location or Biblidetails if not strictly necessary.
+   CORRECT: SELECT TOP 10 acc_no, COUNT(*) FROM t_issue GROUP BY acc_no
 10. MEMBER NAME SEARCH LOGIC:
-    - If user provides ONLY FIRST NAME: `WHERE mem_firstnm LIKE '%UNNATI%' OR mem_lstnm LIKE '%UNNATI%'`
+    - If user provides ONLY FIRST NAME: WHERE mem_firstnm LIKE '%UNNATI%' OR mem_lstnm LIKE '%UNNATI%'
     - If user provides FULL NAME (e.g., "UNNATI SINGH"): ALWAYS use AND condition.
-      `WHERE mem_firstnm LIKE '%UNNATI%' AND mem_lstnm LIKE '%SINGH%'`
-11. TOTAL LIBRARY SIZE: If user asks for "total books in library", use `SELECT COUNT(*) FROM Location`.
+      WHERE mem_firstnm LIKE '%UNNATI%' AND mem_lstnm LIKE '%SINGH%'
+11. TOTAL LIBRARY SIZE: If user asks for "total books in library", use SELECT COUNT(*) FROM Location.
 12. AGGREGATE vs DETAIL: If user asks "how many" or "total", return a single scalar number using a subquery.
 13. SINGLE QUERY RULE: NEVER write multiple SELECT statements in one response.
-    ALWAYS combine them into a SINGLE query using `LEFT JOIN` or `UNION ALL`.
+    ALWAYS combine them into a SINGLE query using LEFT JOIN or UNION ALL.
 14. DAILY/MONTHLY TRENDS (ISSUED vs RETURNED):
-    If user asks for "daily issued return count", DO NOT JOIN `t_issue` and `t_receive` directly (it causes duplicates and bad counts).
-    Instead, query them separately using `UNION ALL` and then group by date.
-    Example:
-    `SELECT Date, SUM(Issued) AS Issued, SUM(Returned) AS Returned FROM (`
-    `  SELECT CAST(iss_dt AS DATE) AS Date, COUNT(*) AS Issued, 0 AS Returned FROM t_issue WHERE iss_dt >= '2024-01-01' GROUP BY CAST(iss_dt AS DATE)`
-    `  UNION ALL`
-    `  SELECT CAST(recv_dt AS DATE) AS Date, 0 AS Issued, COUNT(*) AS Returned FROM t_receive WHERE recv_dt >= '2024-01-01' GROUP BY CAST(recv_dt AS DATE)`
-    `) sub GROUP BY Date ORDER BY Date`
+    If user asks for "daily issued return count", DO NOT JOIN t_issue and t_receive directly.
+    Instead, query them separately using UNION ALL and then group by date.
 15. COMPLETE DAILY CIRCULATION FLOW (List of transactions):
-    If user asks for "poora circulation flow", "all transactions of a day", or "us din ka poora data", DO NOT just query `t_issue`.
-    You MUST fetch BOTH issues and returns for that date using `UNION ALL`.
-    Add a `Transaction_Type` column to differentiate ('Issue' vs 'Return').
-    IMPORTANT: Keep the exact Date and Time in the `Transaction_Date` column. Do NOT use CAST(... AS DATE).
+    If user asks for "poora circulation flow" or "all transactions of a day", you MUST fetch BOTH issues and returns using UNION ALL. Add a Transaction_Type column.
 16. EXACT ID LOOKUPS (CRITICAL):
-    If user provides an exact Member ID (e.g., 'DPDCDC160001') or Accession Number to search, ALWAYS use RTRIM() or LIKE '%' to handle trailing spaces in the `char` columns.
-    ✅ CORRECT: `WHERE RTRIM(mem_cd) = 'DPDCDC160001'`
-    ✅ CORRECT: `WHERE mem_cd LIKE 'DPDCDC160001%'`
-    ❌ WRONG: `WHERE mem_cd = 'DPDCDC160001'`
-17. USER ACCESS CONTROL (CRITICAL):
-    Agar question ke shuru mein "[STRICT ACCESS CONTROL: ...]" block diya ho, toh SQL query mein ALWAYS uss specific `mem_cd` ka filter lagana.
-    Example: `WHERE RTRIM(mem_cd) = 'CCAPCC230009'`
-    Kisi bhi dusre member ka data query mat karna. Agar user general question pooche (jaise "library me kitni books hain") jisme mem_cd filter zaroori nahi, toh usme mat lagana.
+    If user provides an exact Member ID or Accession Number, ALWAYS use RTRIM() or LIKE '%' to handle trailing spaces.
+    CORRECT: WHERE RTRIM(mem_cd) = 'DPDCDC160001'
+17. MEMBER DETAILS FROM m_member_temp:
+    When user asks for phone, DOB, signature, photo, address, email, gender, or ANY extended member detail,
+    query m_member_temp directly. Select ONLY the columns the user asked for (plus name for identification).
+    DO NOT SELECT * — it returns huge binary image data.
+    Example (phone + DOB):
+      SELECT mem_firstnm AS First_Name, mem_lstnm AS Last_Name,
+             mem_prmntphone AS Phone, date_of_birth AS Date_Of_Birth
+      FROM m_member_temp
+      WHERE mem_firstnm LIKE '%MAULI%' AND mem_lstnm LIKE '%SHREE%'
+    Example (signature):
+      SELECT mem_firstnm AS First_Name, mem_lstnm AS Last_Name, member_sign AS Signature_Image
+      FROM m_member_temp
+      WHERE mem_firstnm LIKE '%MAULI%'
 
 ==============================
 SECTION 7: COMPLEX QUERY EXAMPLES
@@ -465,7 +528,7 @@ WHERE B.Tag = '245' AND B.SbFld = 'a'
   AND B.FValue LIKE '%data structure%'
   AND L.Status = 'AV';
 
---- Example B: COMPLETE Issue/Return History of a Book (INCLUDING CURRENTLY ISSUED) ---
+--- Example B: COMPLETE Issue/Return History of a Book ---
 SELECT
     t.iss_dt AS Issue_Date,
     t.due_dt AS Due_Date,
@@ -477,15 +540,29 @@ JOIN m_member M ON M.mem_cd = RTRIM(t.mem_cd)
 WHERE RTRIM(t.acc_no) = '150315'
 ORDER BY t.iss_dt DESC;
 
---- Example C: Active members from a specific department ---
+--- Example C: Member phone, email, DOB, and address from m_member_temp ---
 SELECT
-    M.mem_cd,
-    M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name
-FROM VMember M
-WHERE M.mem_status = 'A'
-  AND M.Fclty_dept_dscr LIKE '%Computer%';
+    mem_firstnm AS First_Name,
+    mem_lstnm AS Last_Name,
+    mem_prmntphone AS Phone,
+    mem_email AS Email,
+    date_of_birth AS Date_Of_Birth,
+    mem_gender AS Gender,
+    mem_prmntadd1 AS Address_Line_1,
+    mem_prmntcity AS City,
+    mem_prmntpin AS PIN_Code
+FROM m_member_temp
+WHERE mem_firstnm LIKE '%MAULI%' AND mem_lstnm LIKE '%SHREE%';
 
---- Example D: Top 10 Most Issued Books (WITHOUT DUPLICATES) ---
+--- Example D: Member signature image ---
+SELECT
+    mem_firstnm AS First_Name,
+    mem_lstnm AS Last_Name,
+    member_sign AS Signature_Image
+FROM m_member_temp
+WHERE mem_firstnm LIKE '%MAULI%' AND mem_lstnm LIKE '%SHREE%';
+
+--- Example E: Top 10 Most Issued Books ---
 SELECT TOP 10
     t.acc_no AS Accession_No,
     COUNT(*) AS Issue_Count
@@ -493,7 +570,7 @@ FROM t_issue t
 GROUP BY t.acc_no
 ORDER BY Issue_Count DESC;
 
---- Example E: Daily Issue and Return Count for a Month ---
+--- Example F: Daily Issue and Return Count for a Month ---
 SELECT
     Date,
     SUM(Issued) AS Issued_Books,
@@ -512,60 +589,17 @@ FROM (
 GROUP BY Date
 ORDER BY Date;
 
---- Example F: COMPLETE DAILY CIRCULATION FLOW (Both Issues AND Returns with EXACT DATE & TIME) ---
-SELECT
-    Transaction_Date,
-    Transaction_Type,
-    Member_Name,
-    Book_Title,
-    Author
-FROM (
-    -- 1. Books Issued on that date (with time)
-    SELECT
-        t.iss_dt AS Transaction_Date,
-        'Issue' AS Transaction_Type,
-        M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
-        B.FValue AS Book_Title,
-        A.FValue AS Author
-    FROM t_issue t
-    JOIN m_member M ON M.mem_cd = RTRIM(t.mem_cd)
-    JOIN Location L ON L.p852 = RTRIM(t.acc_no)
-    JOIN Biblidetails B ON B.RecID = L.RecID AND B.Tag = '245' AND B.SbFld = 'a'
-    LEFT JOIN Biblidetails A ON A.RecID = L.RecID AND A.Tag = '100' AND A.SbFld = 'a'
-    WHERE CAST(t.iss_dt AS DATE) = '2025-05-05'
-
-    UNION ALL
-
-    -- 2. Books Returned on that date (with time)
-    SELECT
-        r.recv_dt AS Transaction_Date,
-        'Return' AS Transaction_Type,
-        M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
-        B.FValue AS Book_Title,
-        A.FValue AS Author
-    FROM t_receive r
-    JOIN m_member M ON M.mem_cd = RTRIM(r.mem_cd)
-    JOIN Location L ON L.p852 = RTRIM(r.accn_no)
-    JOIN Biblidetails B ON B.RecID = L.RecID AND B.Tag = '245' AND B.SbFld = 'a'
-    LEFT JOIN Biblidetails A ON A.RecID = L.RecID AND A.Tag = '100' AND A.SbFld = 'a'
-    WHERE CAST(r.recv_dt AS DATE) = '2025-05-05'
-) sub
-ORDER BY Transaction_Date, Transaction_Type;
-
 ==============================
 SECTION 8: CHART GENERATION DATA FORMAT
 ==============================
-If the user asks for a "report", "graph", "chart", "trend", or "distribution" (e.g., department-wise, subject-wise, monthly), you MUST generate an SQL query that returns EXACTLY two columns named `Label` and `Value`.
-- `Label`: The category or time period (e.g., 'Computer Science', '2024-01').
-- `Value`: The numeric count or sum (e.g., 150, 5000).
+If the user asks for a "report", "graph", "chart", "trend", or "distribution", you MUST generate an SQL query that returns EXACTLY two columns named Label and Value.
+- Label: The category or time period.
+- Value: The numeric count or sum.
 
-CRITICAL: NEVER use aliases like `Department`, `Count`, `Active_Students`, or `Total` for report queries. ALWAYS use `Label` and `Value`.
-
-Example SQL for Report:
-`SELECT M.Fclty_dept_dscr AS Label, COUNT(*) AS Value FROM VMember M WHERE M.mem_status = 'A' GROUP BY M.Fclty_dept_dscr`
+CRITICAL: NEVER use aliases like Department, Count, Active_Students, or Total for report queries. ALWAYS use Label and Value.
 
 CRITICAL EXCEPTION:
-If the user is just searching, listing, or asking "how many", DO NOT use `Label` and `Value` aliases. Use normal descriptive aliases like `Title`, `Total_Students`, `Department`, `Issued_Books`, `Returned_Books`.
+If the user is just searching, listing, or asking "how many", DO NOT use Label and Value aliases. Use normal descriptive aliases like Title, Total_Students, Department, Issued_Books, Returned_Books.
 """
 
 # ==========================================
@@ -573,21 +607,17 @@ If the user is just searching, listing, or asking "how many", DO NOT use `Label`
 # ==========================================
 FOLLOWUP_RESOLVER_PROMPT = """You are a query-rewriting module for a Library Management System chatbot.
 Your ONLY job is to look at the conversation history and the user's CURRENT question, and decide whether the
-current question is a follow-up that depends on context from earlier turns (pronouns, "unke", "unka", "uska",
+current question is a follow-up that depends on context from earlier turns (pronouns, "unhe", "unka", "uska",
 "usme se", "iski", "unhe", "in members ka", "list them", "and their emails", "wapas", "usne", "ismein",
 "pichle wale", implicit topic continuation, etc.).
 
 RULES:
-1. If there is NO conversation history, OR the current question is already fully standalone (it names its own
-   subject/entity and does not rely on anything from earlier turns), output the question EXACTLY AS-IS, with no
-   changes.
-2. If the current question DOES depend on earlier context, rewrite it into one fully standalone question by
-   substituting in the specific entity/topic/filter from the conversation history (e.g. the department, the
-   member name, the book title, the date range, the previous result set being referred to).
+1. If there is NO conversation history, OR the current question is already fully standalone, output the question EXACTLY AS-IS.
+2. If the current question DOES depend on earlier context, rewrite it into one fully standalone question by substituting in the specific entity/topic/filter from the conversation history.
 3. NEVER answer the question. NEVER add SQL. ONLY output the rewritten natural-language question.
-4. Preserve the original language style of the CURRENT question (Hindi / English / Hinglish) — do not translate it.
+4. Preserve the original language style of the CURRENT question.
 5. Do not invent facts that aren't implied by the history. Keep the rewrite concise and faithful.
-6. Output ONLY the rewritten question text. No quotes, no markdown, no explanation, no prefix like "Rewritten:".
+6. Output ONLY the rewritten question text. No quotes, no markdown, no explanation.
 
 CONVERSATION HISTORY (oldest to newest):
 {history}
@@ -598,6 +628,38 @@ CURRENT QUESTION:
 Rewritten standalone question:"""
 
 # ==========================================
+# 3c. FOLLOW-UP SUGGESTIONS PROMPT
+# ==========================================
+FOLLOWUP_SUGGESTIONS_PROMPT = """You are a helpful assistant for a Library Management System chatbot. Based on
+the user's question, the SQL that was run, and the final answer just given, suggest 3 to 4 short, natural
+FOLLOW-UP questions the user might logically want to ask next.
+
+GUIDELINES:
+1. Suggestions must be a sensible NEXT step from what was just answered.
+2. If the answer was empty / "no records found", suggest a broader or corrected search.
+3. Write each suggestion the way an actual library staff member or student would type it — short and casual, in the
+   SAME language/style as the CURRENT QUESTION.
+4. Do NOT repeat or rephrase a question already present in the CONVERSATION HISTORY below.
+5. Keep each suggestion under ~15 words.
+6. Output ONLY a JSON array of strings — nothing else.
+["question one", "question two", "question three"]
+
+CONVERSATION HISTORY (oldest to newest, avoid repeating these):
+{history}
+
+CURRENT QUESTION: {question}
+RESOLVED/STANDALONE QUESTION USED FOR SQL: {resolved_question}
+
+SQL EXECUTED:
+{sql}
+
+FINAL ANSWER GIVEN TO THE USER:
+{answer}
+
+JSON array of 3-4 follow-up questions:"""
+
+
+# ==========================================
 # 4. LANGGRAPH STATE & NODES
 # ==========================================
 class ChatTurn(TypedDict):
@@ -605,8 +667,8 @@ class ChatTurn(TypedDict):
     answer: str
 
 class AgentState(TypedDict):
-    question: str                       # raw question as typed by the user this turn
-    resolved_question: str              # standalone version used for SQL generation
+    question: str
+    resolved_question: str
     sql_query: str
     previous_sql: str
     query_result: str
@@ -614,25 +676,20 @@ class AgentState(TypedDict):
     attempts: int
     error: str
     error_history: List[str]
-    schema_hint: str                    # live ground-truth schema for tables in the failed query
+    schema_hint: str
     chart_base64: Optional[str]
-    chat_history: List[ChatTurn]        # persisted across turns via the checkpointer
+    suggested_followups: List[str]
+    chat_history: List[ChatTurn]
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
 
 def resolve_followup_node(state: AgentState):
-    """
-    Reads chat_history (carried forward automatically by MemorySaver for this
-    thread_id) and decides whether state['question'] is a standalone question
-    or a follow-up that needs to be rewritten using prior context.
-    """
     print("---RESOLVING FOLLOW-UP---")
     question = state["question"]
     history: List[ChatTurn] = state.get("chat_history", []) or []
 
     if not history:
-        print("[RESOLVER] No history yet -> treating as standalone.")
         return {"resolved_question": question}
 
     recent = history[-RESOLVER_CONTEXT_TURNS:]
@@ -651,9 +708,6 @@ def resolve_followup_node(state: AgentState):
         print(f"[RESOLVER ERROR] Falling back to raw question: {e}")
         resolved = question
 
-    print(f"[RESOLVER] Original : {question}")
-    print(f"[RESOLVER] Resolved : {resolved}")
-
     return {"resolved_question": resolved}
 
 
@@ -664,7 +718,6 @@ def generate_sql_node(state: AgentState):
     err_hist = state.get("error_history", [])
     schema_hint = state.get("schema_hint", "")
 
-    # Always generate SQL from the RESOLVED (standalone) question, not the raw one.
     active_question = state.get("resolved_question") or state["question"]
 
     if prev_err:
@@ -701,6 +754,21 @@ def generate_sql_node(state: AgentState):
         "attempts": state.get("attempts", 0) + 1,
     }
 
+
+def _make_llm_friendly_data(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Replace base64 image strings with short placeholders so the LLM context stays small."""
+    llm_data = []
+    for row in data:
+        llm_row = {}
+        for k, v in row.items():
+            if isinstance(v, str) and v.startswith("data:image"):
+                llm_row[k] = f"[IMAGE DATA AVAILABLE — {len(v)} chars of base64 encoded image]"
+            else:
+                llm_row[k] = v
+        llm_data.append(llm_row)
+    return llm_data
+
+
 def execute_sql_node(state: AgentState):
     print("---EXECUTING SQL---")
     clean_sql = state["sql_query"].replace("```sql", "").replace("```", "").strip()
@@ -708,12 +776,16 @@ def execute_sql_node(state: AgentState):
 
     result = run_sql(clean_sql)
     if result["success"]:
-        data_str = str(result["data"])
+        raw_data = result["data"]
+
+        llm_data = _make_llm_friendly_data(raw_data)
+
+        data_str = str(llm_data)
         if len(data_str) > 12000:
-            data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {result['rows']}]"
+            data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {len(raw_data)}]"
         return {
             "query_result": data_str,
-            "report_data": result["data"],
+            "report_data": raw_data,
             "error": "",
             "schema_hint": "",
         }
@@ -737,6 +809,7 @@ def execute_sql_node(state: AgentState):
             "schema_hint": schema_hint,
         }
 
+
 def check_status_node(state: AgentState):
     if state.get("error"):
         print("---ERROR FOUND, RETRYING---")
@@ -747,6 +820,7 @@ def check_status_node(state: AgentState):
     else:
         print("---SUCCESS---")
         return "generate_chart"
+
 
 def generate_chart_node(state: AgentState):
     print("---CHECKING FOR CHART DATA---")
@@ -787,6 +861,7 @@ def generate_chart_node(state: AgentState):
 
     return {"chart_base64": chart_b64}
 
+
 def generate_answer_node(state: AgentState):
     print("---GENERATING FINAL ANSWER---")
 
@@ -800,7 +875,10 @@ def generate_answer_node(state: AgentState):
         actual_data = ast.literal_eval(data_str)
         if isinstance(actual_data, list):
             row_count = len(actual_data)
-            row_count_note = f"\nIMPORTANT: The SQL query returned exactly {row_count} rows. If the user asks 'how many' or for a count, you MUST use this exact number ({row_count}) and do not guess or count manually."
+            row_count_note = (
+                f"\nIMPORTANT: The SQL query returned exactly {row_count} rows. "
+                f"If the user asks 'how many' or for a count, you MUST use this exact number ({row_count})."
+            )
     except Exception as e:
         print(f"Could not calculate row count for LLM: {e}")
 
@@ -810,25 +888,36 @@ def generate_answer_node(state: AgentState):
         SystemMessage(content=f"""You are a helpful, professional library assistant. Based on the user's question and the SQL query result, give a clear, highly accurate, and perfectly formatted answer.
 
 LANGUAGE & FORMATTING RULES:
-1. CRITICAL: DO NOT mention or hallucinate about downloading files, Excel copies, PDF copies, or "full report on file". The system handles file downloads automatically. You just format the data provided. If you mention files, it is a severe error.
+1. CRITICAL: DO NOT mention or hallucinate about downloading files, Excel copies, PDF copies, or "full report on file".
 2. Reply in the EXACT SAME language the user used (Hindi, English, or Hinglish).
-3. If the result contains multiple rows (e.g., multiple members with the same name, or multiple books), ALWAYS format it as a clean Markdown Table. DO NOT write it as a paragraph.
-4. If the user asks for member details AND issue history, present the details in a table, and if history is available, present it in a separate table. If history is empty, say "This member has not issued any books."
+3. If the result contains multiple rows, ALWAYS format it as a clean Markdown Table.
+4. If the user asks for member details AND issue history, present the details in a table, and if history is available, present it in a separate table.
 5. If the result is a count or aggregate, write a clear, concise sentence.
 6. If the result is empty (e.g., []), politely say "No records found matching your query." Do not invent data.
 7. For dates, format as DD-MM-YYYY.
 8. For money, prefix with Rs. or ₹.
 9. Do not include raw JSON or Python dictionary syntax in the output. Parse it and present it beautifully.
-10. TABLE SERIAL NUMBERING:
-   Whenever you format the result as a Markdown table with multiple rows, ALWAYS add a first column named "S.No.".
-   - Start from 1.
-   - Number every displayed row sequentially: 1, 2, 3, 4, 5, ...
-   - If the table contains 64 rows, show S.No. from 1 to 64.
-   - Never skip or duplicate a serial number.
-   - S.No. must be the FIRST column.
-   - S.No. is only for display and must not come from the SQL result.
-   - Do not change, remove, or invent any database values.
-   - If the result has only a single value/count and is not a table, do NOT add S.No.
+10. TABLE SERIAL NUMBERING: Whenever you format the result as a Markdown table with multiple rows, ALWAYS add a first column named "S.No." starting from 1.
+
+IMAGE / SIGNATURE / PHOTO DATA HANDLING:
+- If you see "[IMAGE DATA AVAILABLE — ... chars of base64 encoded image]" in the SQL Result Data, this means
+  a binary image (such as a member's signature or photo) was successfully retrieved.
+- In your response, MENTION that the image is available and attached in the response data.
+- Example: "MAULI SHREE ki signature image response me available hai."
+- Example: "Member ki photo image data ke roop me available hai."
+- DO NOT try to display or describe the image content. Just confirm it is available.
+- The frontend will handle displaying the actual image from the base64 data.
+
+DATE OF BIRTH FORMATTING:
+- If date_of_birth is in the result, format it as DD-MM-YYYY (e.g., 08-11-1994).
+
+PHONE NUMBER FORMATTING:
+- Present phone numbers clearly, e.g., "Phone: 7408049743"
+
+MEMBER DETAILS TABLE:
+When presenting member details from m_member_temp, use this format:
+| S.No. | Name | Phone | Email | Date of Birth | Gender | Address |
+Only include columns that the user asked for. Do not add extra columns.
 {chart_note}"""),
         HumanMessage(content=f"User Question (as originally typed): {state['question']}\n\n"
                               f"Resolved standalone question used for SQL: {active_question}\n\n"
@@ -841,13 +930,44 @@ LANGUAGE & FORMATTING RULES:
     return {"query_result": response.content}
 
 
+def suggest_followups_node(state: AgentState):
+    print("---SUGGESTING FOLLOW-UP QUESTIONS---")
+    history: List[ChatTurn] = state.get("chat_history", []) or []
+    recent = history[-RESOLVER_CONTEXT_TURNS:]
+    history_text = "\n".join(f"Q: {h['question']}" for h in recent) or "(none yet)"
+
+    prompt = FOLLOWUP_SUGGESTIONS_PROMPT.format(
+        history=history_text,
+        question=state["question"],
+        resolved_question=state.get("resolved_question") or state["question"],
+        sql=state.get("sql_query", "") or "(no SQL — the previous step failed)",
+        answer=state.get("query_result", ""),
+    )
+
+    suggestions: List[str] = []
+    raw = ""
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = (response.content or "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            suggestions = [str(s).strip() for s in parsed if str(s).strip()][:4]
+    except Exception as e:
+        print(f"[SUGGEST] JSON parse failed ({e}), trying loose fallback...")
+        try:
+            parsed = ast.literal_eval(raw)
+            if isinstance(parsed, list):
+                suggestions = [str(s).strip() for s in parsed if str(s).strip()][:4]
+        except Exception as e2:
+            print(f"[SUGGEST] Fallback also failed, skipping suggestions: {e2}")
+            suggestions = []
+
+    print(f"[SUGGEST] {suggestions}")
+    return {"suggested_followups": suggestions}
+
+
 def update_memory_node(state: AgentState):
-    """
-    Appends this turn (raw question + final formatted answer) to chat_history
-    and trims it to the last MAX_HISTORY_TURNS turns. Because this state field
-    is checkpointed per thread_id, it will be available to resolve_followup_node
-    on the NEXT call for the same thread_id.
-    """
     print("---UPDATING CONVERSATION MEMORY---")
     history: List[ChatTurn] = state.get("chat_history", []) or []
     history = history + [{
@@ -866,6 +986,7 @@ workflow.add_node("generate_sql", generate_sql_node)
 workflow.add_node("execute_sql", execute_sql_node)
 workflow.add_node("generate_chart", generate_chart_node)
 workflow.add_node("generate_answer", generate_answer_node)
+workflow.add_node("suggest_followups", suggest_followups_node)
 workflow.add_node("update_memory", update_memory_node)
 
 workflow.set_entry_point("resolve_followup")
@@ -881,19 +1002,19 @@ workflow.add_conditional_edges(
     }
 )
 workflow.add_edge("generate_chart", "generate_answer")
-workflow.add_edge("generate_answer", "update_memory")
+workflow.add_edge("generate_answer", "suggest_followups")
+workflow.add_edge("suggest_followups", "update_memory")
 workflow.add_edge("update_memory", END)
 
-library_agent = workflow.compile(
-    checkpointer=checkpointer
-)
+library_agent = workflow.compile(checkpointer=checkpointer)
+
 
 # ==========================================
 # 5. FASTAPI APP SETUP
 # ==========================================
 app = FastAPI(
     title="SOUL30 Library Text-to-SQL API",
-    version="3.1"
+    version="3.6"
 )
 
 app.add_middleware(
@@ -904,54 +1025,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# RFID AUTHENTICATION MODELS & ENDPOINT
-# ==========================================
-class RfidAuthRequest(BaseModel):
-    rfid: str
 
-class RfidAuthResponse(BaseModel):
-    success: bool
-    mem_cd: Optional[str] = None
-    member_name: Optional[str] = None
-    message: str
-
-@app.post("/auth/rfid", response_model=RfidAuthResponse)
-def rfid_auth(request: RfidAuthRequest):
-    """
-    Kiosk RFID scan karta hai -> backend mem_cd nikaalta hai.
-    """
-    rfid = (request.rfid or "").strip()
-    if not rfid:
-        return RfidAuthResponse(success=False, message="RFID khali hai")
-
-    try:
-        query = f"SELECT R.mem_cd, M.mem_firstnm, M.mem_lstnm FROM m_memberRfid R LEFT JOIN m_member M ON M.mem_cd = RTRIM(R.mem_cd) WHERE R.Rfid = '{rfid}'"
-        results = execute_query(query, limit=False)
-    except Exception as e:
-        return RfidAuthResponse(success=False, message=f"DB Error: {e}")
-
-    if not results:
-        return RfidAuthResponse(success=False, message="Yeh RFID kisi member se mapped nahi hai")
-
-    mem_cd = (results[0].get("mem_cd") or "").strip()
-    first_nm = (results[0].get("mem_firstnm") or "").strip()
-    last_nm = (results[0].get("mem_lstnm") or "").strip()
-    
-    return RfidAuthResponse(
-        success=True,
-        mem_cd=mem_cd,
-        member_name=f"{first_nm} {last_nm}".strip(),
-        message="Login successful"
-    )
-
-# ==========================================
-# ASK ENDPOINT MODELS & LOGIC
-# ==========================================
 class QueryRequest(BaseModel):
     question: str
     thread_id: str
-    mem_cd: Optional[str] = None  # <-- Naya field add kiya
+
 
 class QueryResponse(BaseModel):
     question: str
@@ -959,131 +1037,168 @@ class QueryResponse(BaseModel):
     sql_query: str
     answer: str
     chart_base64: Optional[str] = None
+    audio_base64: Optional[str] = None
+    image_data: Optional[List[Dict[str, Any]]] = None
     attempts: int
     debug_error: Optional[str] = None
     report_available: bool = False
     report_id: Optional[str] = None
+    suggested_followups: List[str] = []
 
-
-# ==========================================
-# LIVEKIT VOICE SESSION MODELS
-# ==========================================
-class LiveKitSessionRequest(BaseModel):
-    """Request to start a voice chat session with the LiveKit agent.
-
-    The backend generates the room + join token and (optionally) dispatches the
-    agent, so the client only has to connect with ``url`` + ``token``.
-    """
-    room: Optional[str] = None          # optional; a fresh room is created if omitted
-    identity: Optional[str] = None      # optional; defaults to a generated identity
-    user_id: Optional[str] = None       # passed to the agent as dispatch metadata
-    thread_id: Optional[str] = None     # conversation memory key for follow-ups
-    metadata: Optional[Dict[str, Any]] = None  # extra metadata forwarded to the agent
-    dispatch: bool = True               # spawn the agent for this session
-
-
-class LiveKitDispatchRequest(BaseModel):
-    """Explicitly dispatch the agent into an existing room via the server API."""
-    room: str
-    user_id: Optional[str] = None
-    thread_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-
-class LiveKitResponse(BaseModel):
-    url: str
-    token: str
-    room: str
-    identity: str
-    agent_name: str
-    ttl_seconds: int
-    expires_at: str
-    dispatch: str  # "token" | "api" | "none"
-
-
-class LiveKitDispatchResponse(BaseModel):
-    room: str
-    agent_name: str
-    dispatch_id: Optional[str] = None
-    dispatch: str  # "api" | "token" | "none"
 
 @app.get("/welcome")
 def welcome_api():
     return {
         "message": "Welcome to the SOUL 3.0 Library AI Assistant! Here are 10 complex questions you can ask to test the system:",
         "sample_questions": [
-            "Library me total kitni physical books hain aur usme se kitni unique titles (book names) hain? Sirf count batao.",
+            "MAULI SHREE naam ke member ka phone number, email aur date of birth batao.",
+            "MAULI SHREE ki signature do.",
+            "Anju Lata naam ki member ki poori details (phone, address, DOB, gender) dikhao.",
+            "Library me total kitni physical books hain?",
             "Computer science subject par 5 available books ke title aur author dikhao.",
-            "Aise 10 members dikhao jinki books overdue (late) hain, yani abhi tak wapas nahi aayi aur due date nikal gayi. Member ka naam, book title aur due date do.",
-            "UNNATI SINGH naam ki member ki poori details (ID, Department, Email, Phone) do aur usne kaun si book issue ki hai uski history bhi dikhao.",
-            "Library me total kitni aisi books hain jinka subject 'Physics' hai? Sirf total count batao, list mat dena.",
-            "Computer Centre department me kitne active students hain? Unke naam aur member ID list karo.",
-            "Member ID 'UGCABC210047' ne aaj tak kaun-kaun si books issue ki hain? Book title aur issue date ke sath table banao.",
-            "Aise 5 books dikhao jo pichle kuchh mahine me wapas return kar di gayi thi. Book title, member ID aur return date do.",
-            "Management subject par kitni books hain aur library me total kitni books hain? Dono ka exact count ek hi answer me do.",
-            "Pichle 1 saal me sabse zyada kitni baar issue ki gayi 3 books kaun si hain? Unka title aur total issue count batao."
+            "UNNATI SINGH naam ki member ki poori details do aur usne kaun si book issue ki hai uski history bhi dikhao.",
+            "Computer Centre department me kitne active students hain?",
+            "MUMTAJ BANO MIYA ki photo do.",
+            "Pichle 1 saal me sabse zyada kitni baar issue ki gayi 3 books kaun si hain?",
+            "Aise 10 members dikhao jinki books overdue hain. Member ka naam, book title aur due date do."
         ]
     }
 
 @app.get("/")
 def read_root():
-    return {"status": "SOUL30 Library Text-to-SQL API v3.1 (with follow-up memory) is running perfectly!"}
+    return {"status": "SOUL30 Library Text-to-SQL API v3.6 (member details + signature support) is running perfectly!"}
 
-@app.post("/ask", response_model=QueryResponse)
-def ask_library_agent(request: QueryRequest):
-    user_question = request.question
-    mem_cd = (request.mem_cd or "").strip()
-    
-    # ---- IDENTITY INJECTION ----
-    # Agar mem_cd aaya hai, toh LLM ko strict instruction do ki sirf iska data nikale
-    if mem_cd:
-        active_question = (
-            f"[STRICT ACCESS CONTROL: The logged-in user's mem_cd is '{mem_cd}'. "
-            f"You MUST filter all personal data (issues, returns, fines, member details) by this exact mem_cd. "
-            f"Always use WHERE RTRIM(mem_cd) = '{mem_cd}'. "
-            f"DO NOT show any other member's data under any circumstances.]\n\n"
-            f"User Question: {user_question}"
-        )
-    else:
-        # Agar koi mem_cd nahi bheja (general query)
-        active_question = user_question
 
-    print(f"\n[API] mem_cd={mem_cd} Q={user_question}\n")
+# ==========================================
+# TTS HELPER FUNCTION
+# ==========================================
+def generate_audio_base64(text: str) -> Optional[str]:
+    if not text:
+        return None
+    clean_text = re.sub(r'[*_#`]', '', text)
+    try:
+        async def _tts():
+            communicate = edge_tts.Communicate(clean_text, TTS_VOICE)
+            audio_buffer = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_buffer.write(chunk["data"])
+            return audio_buffer
+        buffer = asyncio.run(_tts())
+        buffer.seek(0)
+        audio_b64 = base64.b64encode(buffer.read()).decode('utf-8')
+        print("[TTS] Audio generated successfully.")
+        return audio_b64
+    except Exception as e:
+        print(f"[TTS ERROR] Failed to generate audio: {e}")
+        return None
+
+
+# ==========================================
+# STT HELPER FUNCTION
+# ==========================================
+def transcribe_audio_file(audio_bytes: bytes, filename: str, content_type: str) -> str:
+    files = {"file": (filename, audio_bytes, content_type)}
+    data = {}
+    if STT_LANGUAGE:
+        data["language"] = STT_LANGUAGE
+
+    print(f"[STT] Sending audio to {STT_TRANSCRIBE_FILE_URL} ...")
+    try:
+        response = requests.post(STT_TRANSCRIBE_FILE_URL, files=files, data=data, timeout=120)
+    except requests.exceptions.RequestException as e:
+        print(f"[STT ERROR] Request failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Speech-to-Text server unreachable: {e}")
+
+    if response.status_code == 400:
+        raise HTTPException(status_code=400, detail="Audio file is empty, too short, or invalid. Please try recording again.")
+    if response.status_code == 429:
+        raise HTTPException(status_code=503, detail="Speech-to-Text server is busy right now. Please try again in a moment.")
+    if response.status_code == 500:
+        raise HTTPException(status_code=502, detail="Speech-to-Text transcription failed on the server. Please try again.")
 
     try:
-        final_state = library_agent.invoke(
-            {
-                # Yahan hum active_question bhej rahe hain (jo context ke saath modified hai)
-                "question": active_question,   
-                "resolved_question": "",
-                "attempts": 0,
-                "error": "",
-                "previous_sql": "",
-                "error_history": [],
-                "schema_hint": "",
-                "chart_base64": None,
-                "report_data": None,
-            },
-            config={
-                "configurable": {
-                    "thread_id": request.thread_id
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f"[STT ERROR] HTTP error: {e}")
+        raise HTTPException(status_code=502, detail=f"Speech-to-Text server error: {e}")
+
+    payload = response.json()
+    if not payload.get("success", False):
+        msg = payload.get("message", "Unknown STT error")
+        print(f"[STT ERROR] success=false: {msg}")
+        raise HTTPException(status_code=502, detail=f"Speech-to-Text failed: {msg}")
+
+    result = payload.get("data", {}) or {}
+    transcript = (result.get("transcript") or "").strip()
+    detected_lang = result.get("language")
+    confidence = result.get("confidence")
+    print(f"[STT] Transcript: '{transcript}' | language={detected_lang} | confidence={confidence}")
+
+    if not transcript:
+        raise HTTPException(status_code=400, detail="No speech detected in the audio. Please try speaking again.")
+
+    return transcript
+
+
+# ==========================================
+# IMAGE DATA EXTRACTOR
+# ==========================================
+def extract_image_data(report_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Walk through query results and pull out any base64 image fields."""
+    images = []
+    if not report_data:
+        return images
+    for idx, row in enumerate(report_data):
+        first_name = row.get("First_Name") or row.get("mem_firstnm") or ""
+        last_name = row.get("Last_Name") or row.get("mem_lstnm") or ""
+        member_name = f"{first_name} {last_name}".strip() or f"Row {idx+1}"
+        for col, val in row.items():
+            if isinstance(val, str) and val.startswith("data:image"):
+                label_map = {
+                    "member_sign": "Signature",
+                    "member_photo": "Photo",
+                    "member_receipt": "Fee Receipt",
+                    "Signature_Image": "Signature",
+                    "Photo_Image": "Photo",
                 }
+                label = label_map.get(col, col.replace("_", " ").title())
+                images.append({
+                    "row_index": idx,
+                    "member_name": member_name,
+                    "column": col,
+                    "label": label,
+                    "mime_type": "image/jpeg",
+                    "base64": val,
+                })
+    return images
+
+
+# ==========================================
+# PROCESS AGENT REQUEST (shared by /ask and /ask_audio)
+# ==========================================
+def process_agent_request(user_question: str, thread_id: str) -> QueryResponse:
+    print(f"\n[API] User Question: {user_question}\n")
+
+    final_state = library_agent.invoke(
+        {
+            "question": user_question,
+            "resolved_question": "",
+            "attempts": 0,
+            "error": "",
+            "previous_sql": "",
+            "error_history": [],
+            "schema_hint": "",
+            "chart_base64": None,
+            "report_data": None,
+            "suggested_followups": [],
+        },
+        config={
+            "configurable": {
+                "thread_id": thread_id
             }
-        )
-    except groq.RateLimitError as e:
-        print(f"[API] GROQ RATE LIMIT EXCEEDED: {e}")
-        return QueryResponse(
-            question=user_question,
-            resolved_question=user_question,
-            sql_query="",
-            answer="सिस्टम अभी बहुत व्यस्त है, कृपया थोड़ी देर बाद फिर पूछें। "
-                   "The system is busy right now, please try again in a moment.",
-            attempts=1,
-            debug_error=f"Rate limit exceeded: {e}",
-        )
-    except Exception as e:
-        print(f"[API] UNEXPECTED ERROR: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Library agent failed: {e}")
+        }
+    )
 
     final_answer = final_state.get("query_result", "Agent failed to generate answer.")
     executed_sql = (final_state.get("sql_query", "")
@@ -1091,30 +1206,15 @@ def ask_library_agent(request: QueryRequest):
     db_error = final_state.get("error", None) or None
     chart_b64 = final_state.get("chart_base64", None)
     resolved_q = final_state.get("resolved_question", "") or user_question
+    suggested_followups = final_state.get("suggested_followups", []) or []
 
-    # ---- SAFETY NET (Defense in Depth) ----
-    # Agar LLM ne bhool kar bhi kisi aur ka data nikalne ki koshish ki, toh yahan block karo
-    if mem_cd:
-        sql_lower = executed_sql.lower()
-        # Check karo ki SQL mein user ka mem_cd hai ya nahi
-        if mem_cd.lower() not in sql_lower:
-            sensitive_tables = ["m_member", "t_issue", "t_receive", "t_reserve", "t_memfine", "vmember", "vcmpltissuedetails"]
-            # Agar SQL in tables ko touch kar raha hai aur mem_cd missing hai, toh leak ho sakta hai
-            if any(table in sql_lower for table in sensitive_tables):
-                return QueryResponse(
-                    question=user_question,
-                    resolved_question="",
-                    sql_query="",
-                    answer="🔒 Aap sirf apna data dekh sakte hain. Yeh query access nahi ki ja sakti.",
-                    attempts=final_state.get("attempts", 0),
-                    debug_error="Blocked: Missing mem_cd filter",
-                    report_available=False,
-                    report_id=None
-                )
+    audio_b64 = generate_audio_base64(final_answer)
 
     report_available = False
     report_id = None
     report_data = final_state.get("report_data", None)
+
+    image_data_list = []
     if report_data and isinstance(report_data, list) and len(report_data) > 0:
         try:
             report_id = store_report(
@@ -1127,26 +1227,61 @@ def ask_library_agent(request: QueryRequest):
             print(f"[REPORT_STORE] Failed to store report: {e}")
             report_available = False
 
+        image_data_list = extract_image_data(report_data)
+        if image_data_list:
+            print(f"[IMAGE_DATA] Extracted {len(image_data_list)} image(s) from query results.")
+
     return QueryResponse(
         question=user_question,
         resolved_question=resolved_q,
         sql_query=executed_sql,
         answer=final_answer,
         chart_base64=chart_b64,
+        audio_base64=audio_b64,
+        image_data=image_data_list if image_data_list else None,
         attempts=final_state.get("attempts", 0),
         debug_error=db_error,
         report_available=report_available,
         report_id=report_id,
+        suggested_followups=suggested_followups,
     )
+
+
+@app.post("/ask", response_model=QueryResponse)
+def ask_library_agent(request: QueryRequest):
+    return process_agent_request(request.question, request.thread_id)
+
+
+@app.post("/ask_audio", response_model=QueryResponse)
+def ask_audio_library_agent(
+    audio: UploadFile = File(...),
+    thread_id: str = Form(...)
+):
+    print(f"\n[API] Received audio file: {audio.filename} for thread_id: {thread_id}")
+
+    audio_bytes = audio.file.read()
+    transcribed_text = transcribe_audio_file(
+        audio_bytes=audio_bytes,
+        filename=audio.filename or "recording.wav",
+        content_type=audio.content_type or "application/octet-stream",
+    )
+
+    print(f"[AUDIO API] Transcription successful: {transcribed_text}")
+    return process_agent_request(transcribed_text, thread_id)
+
+
+@app.get("/stt/health")
+def stt_health():
+    try:
+        resp = requests.get(STT_HEALTH_URL, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"STT server health check failed: {e}")
 
 
 @app.post("/reset-memory/{thread_id}")
 def reset_memory(thread_id: str):
-    """
-    Clears conversation memory for a given thread_id by writing an empty
-    chat_history into the checkpoint. Call this when the user starts a
-    brand-new chat session in the frontend, so old context doesn't leak in.
-    """
     try:
         library_agent.update_state(
             config={"configurable": {"thread_id": thread_id}},
@@ -1155,127 +1290,6 @@ def reset_memory(thread_id: str):
         return {"status": "ok", "detail": f"Memory cleared for thread_id={thread_id}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not reset memory: {e}")
-
-
-# ==========================================
-# 5b. LIVEKIT VOICE AGENT ENDPOINTS
-# ==========================================
-def _build_session_response(
-    room: str,
-    identity: str,
-    dispatch_method: str,
-    dispatch_metadata: Optional[Dict[str, Any]],
-) -> LiveKitResponse:
-    token = create_join_token(
-        room=room,
-        identity=identity,
-        name=identity,
-        dispatch_metadata=dispatch_metadata,
-        ttl_seconds=lk_settings.token_ttl_seconds,
-    )
-    expires = datetime.now(timezone.utc) + timedelta(seconds=lk_settings.token_ttl_seconds)
-    return LiveKitResponse(
-        url=lk_settings.livekit_url,
-        token=token,
-        room=room,
-        identity=identity,
-        agent_name=lk_settings.agent_name,
-        ttl_seconds=lk_settings.token_ttl_seconds,
-        expires_at=expires.isoformat(),
-        dispatch=dispatch_method,
-    )
-
-
-@app.get("/api/livekit/config")
-def livekit_config():
-    """Public, safe client config (no secrets)."""
-    return {
-        "url": lk_settings.livekit_url,
-        "agent_name": lk_settings.agent_name,
-        "token_ttl_seconds": lk_settings.token_ttl_seconds,
-        "tts_language": lk_settings.tts_language,
-    }
-
-
-@app.post("/api/livekit/session", response_model=LiveKitResponse)
-def livekit_session(request: LiveKitSessionRequest):
-    """
-    The main entry point for the web client.
-
-    Generates a fresh room (unless one is provided), issues a join token that
-    carries the agent dispatch, and spawns the LiveKit agent. The client then
-    connects to ``url`` with ``token`` and the voice conversation begins.
-
-    Use a fresh session (no room) per voice chat so the agent is dispatched on
-    room creation. Pass ``thread_id`` to keep follow-up memory in the library
-    text-to-SQL backend, and ``user_id`` for analytics.
-    """
-    room = request.room or generate_room_name("soul")
-    identity = request.identity or f"user-{uuid.uuid4().hex[:10]}"
-
-    dispatch_metadata = dict(request.metadata or {})
-    if request.user_id:
-        dispatch_metadata["user_id"] = request.user_id
-    if request.thread_id:
-        dispatch_metadata["thread_id"] = request.thread_id
-    dispatch_metadata.setdefault("session_id", uuid.uuid4().hex[:16])
-
-    dispatch_method = "none"
-    if request.dispatch:
-        try:
-            dispatch_metadata["room"] = room
-            dispatch_metadata["identity"] = identity
-            # The token's room config dispatches the agent the instant the
-            # client connects and creates the room.
-            dispatch_method = "token"
-            return _build_session_response(room, identity, dispatch_method, dispatch_metadata)
-        except Exception as e:
-            print(f"[LIVEKIT] Could not attach token dispatch: {e}")
-            raise HTTPException(status_code=500, detail=f"LiveKit dispatch failed: {e}")
-
-    return _build_session_response(room, identity, dispatch_method, None)
-
-
-@app.post("/api/livekit/token", response_model=LiveKitResponse)
-def livekit_token(request: LiveKitSessionRequest):
-    """
-    Plain join token without automatic agent dispatch. Use when the room
-    already exists or the agent is dispatched separately via /api/livekit/dispatch.
-    """
-    room = request.room or generate_room_name("soul")
-    identity = request.identity or f"user-{uuid.uuid4().hex[:10]}"
-    return _build_session_response(room, identity, "none", None)
-
-
-@app.post("/api/livekit/dispatch", response_model=LiveKitDispatchResponse)
-async def livekit_dispatch(request: LiveKitDispatchRequest):
-    """
-    Explicitly spawn the agent into an existing room via the LiveKit server
-    API (AgentDispatchService). Falls back to a token room-config dispatch
-    warning if the HTTP API is unreachable.
-    """
-    dispatch_metadata = dict(request.metadata or {})
-    if request.user_id:
-        dispatch_metadata["user_id"] = request.user_id
-    if request.thread_id:
-        dispatch_metadata["thread_id"] = request.thread_id
-
-    try:
-        dispatch_id = await dispatch_agent(request.room, dispatch_metadata)
-        return LiveKitDispatchResponse(
-            room=request.room,
-            agent_name=lk_settings.agent_name,
-            dispatch_id=dispatch_id,
-            dispatch="api",
-        )
-    except Exception as e:
-        print(f"[LIVEKIT] AgentDispatchService unavailable ({e}); using token dispatch instead.")
-        return LiveKitDispatchResponse(
-            room=request.room,
-            agent_name=lk_settings.agent_name,
-            dispatch_id=None,
-            dispatch="token",
-        )
 
 
 # ==========================================
@@ -1288,15 +1302,41 @@ def download_excel(report_id: str):
         raise HTTPException(status_code=404, detail="Report not found or expired.")
 
     try:
-        df = pd.DataFrame(rdata["data"])
+        data = rdata["data"]
+        df = pd.DataFrame(data)
         df = df.where(pd.notnull(df), None)
 
         tmp_dir = tempfile.gettempdir()
         tmp_path = os.path.join(tmp_dir, f"report_{report_id}.xlsx")
 
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            # Clear base64 strings from dataframe
+            for col in df.columns:
+                df[col] = df[col].apply(
+                    lambda v: "" if isinstance(v, str) and v.startswith("data:image") else v
+                )
+            
             df.to_excel(writer, index=False, sheet_name="Report")
             worksheet = writer.sheets["Report"]
+            
+            # Insert actual images into Excel cells
+            for r_idx, row in enumerate(data):
+                for c_idx, col_name in enumerate(row.keys()):
+                    val = row[col_name]
+                    if isinstance(val, str) and val.startswith("data:image"):
+                        try:
+                            b64_str = val.split(",")[1]
+                            img_data = base64.b64decode(b64_str)
+                            img_io = io.BytesIO(img_data)
+                            xl_img = OpenpyxlImage(img_io)
+                            xl_img.width = 120
+                            xl_img.height = 120
+                            cell_coord = f"{get_column_letter(c_idx + 1)}{r_idx + 2}"
+                            worksheet.add_image(xl_img, cell_coord)
+                            worksheet.row_dimensions[r_idx + 2].height = 90
+                        except Exception as e:
+                            print(f"Excel image insert error: {e}")
+
             for col_cells in worksheet.columns:
                 max_length = max(
                     (len(str(cell.value)) if cell.value is not None else 0)
@@ -1313,6 +1353,7 @@ def download_excel(report_id: str):
     except Exception as e:
         print(f"[EXCEL ERROR] {e}")
         raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
+
 
 @app.get("/report/{report_id}/pdf")
 def download_pdf(report_id: str):
@@ -1363,11 +1404,21 @@ def download_pdf(report_id: str):
 
         col_headers = [str(c) for c in df.columns]
         table_data = [col_headers]
+        
         for _, row in df.iterrows():
             row_vals = []
             for v in row.tolist():
                 if v is None or (isinstance(v, float) and pd.isna(v)):
                     row_vals.append("")
+                elif isinstance(v, str) and v.startswith("data:image"):
+                    try:
+                        b64_str = v.split(",")[1]
+                        img_data = base64.b64decode(b64_str)
+                        img_io = io.BytesIO(img_data)
+                        rl_img = RLImage(img_io, width=100, height=100)
+                        row_vals.append(rl_img)
+                    except Exception:
+                        row_vals.append("[Image Error]")
                 elif isinstance(v, (pd.Timestamp,)):
                     row_vals.append(v.strftime("%d-%m-%Y %H:%M"))
                 else:
@@ -1410,6 +1461,7 @@ def download_pdf(report_id: str):
     except Exception as e:
         print(f"[PDF ERROR] {e}")
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+
 
 @app.get("/report/{report_id}/status")
 def report_status(report_id: str):

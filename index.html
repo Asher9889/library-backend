@@ -5,17 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta name="theme-color" content="#1B2A44" />
 <title>SOUL 3.0 — Reference Desk</title>
-<meta name="description" content="AI Reference Desk for the SOUL 3.0 Library — ask in plain language, get answers, SQL, and charts." />
+<meta name="description" content="AI Reference Desk for the SOUL 3.0 Library — ask in plain language, get answers, SQL, and charts with voice." />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231B2A44' stroke-width='2'%3E%3Cpath d='M3 5c2-1.2 4.5-1.6 7-1v14c-2.5-.6-5-.2-7 1V5Z'/%3E%3Cpath d='M21 5c-2-1.2-4.5-1.6-7-1v14c2.5-.6 5-.2 7 1V5Z'/%3E%3C/svg%3E" />
 
-<!-- Fonts: Fraunces (display / catalog headings), Inter (body), IBM Plex Mono (call numbers, SQL, stamps) -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
-<!-- Tailwind (CDN, config extended below) -->
 <script src="https://cdn.tailwindcss.com"></script>
-<!-- Markdown rendering for assistant answers (tables, lists, bold) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/11.1.1/marked.min.js"></script>
 
 <script>
@@ -58,7 +55,6 @@
   ::selection { background: #A9803D; color: #FBF7EC; }
   *:focus-visible { outline: 2px solid #2F5D50; outline-offset: 2px; }
 
-  /* Scrollbars */
   .scroll-thin::-webkit-scrollbar { width: 9px; height: 9px; }
   .scroll-thin::-webkit-scrollbar-track { background: transparent; }
   .scroll-thin::-webkit-scrollbar-thumb { background: rgba(27,42,68,0.22); border-radius: 20px; border: 2px solid transparent; background-clip: content-box; }
@@ -67,21 +63,17 @@
   .scroll-thin-x::-webkit-scrollbar-track { background: transparent; }
   .scroll-thin-x::-webkit-scrollbar-thumb { background: rgba(27,42,68,0.18); border-radius: 20px; }
 
-  /* Ruled index-card texture */
   .ruled {
     background-image: repeating-linear-gradient(to bottom, transparent 0px, transparent 27px, rgba(27,42,68,0.07) 28px);
     background-position: 0 52px;
   }
 
-  /* Single reinforcement ring, top-left — decorative, safe from stamp collisions */
   .ring-hole { position: absolute; top: 16px; left: 16px; width: 14px; height: 14px; border-radius: 9999px;
     background: #EFE7D4; box-shadow: inset 0 1px 3px rgba(27,42,68,0.4), 0 0 0 2px rgba(27,42,68,0.08); }
 
-  /* Wood drawer-front texture for sidebar header */
   .drawer-wood { background: linear-gradient(180deg, #2A3E5E 0%, #1B2A44 55%, #17233A 100%); }
   .brass-plate { background: linear-gradient(180deg, #E7CE93 0%, #C7A55C 55%, #A9803D 100%); border: 1px solid #8B6A32; }
 
-  /* Due-date stamp — signature element (sized + spaced so text never collides) */
   .stamp-wrap { pointer-events: none; }
   .stamp {
     transform-origin: center;
@@ -112,7 +104,6 @@
   .card-slide { animation: cardSlide 900ms ease-in-out infinite; }
   @keyframes cardSlide { 0%, 100% { transform: translateX(0); } 50% { transform: translateX(6px); } }
 
-  /* Top progress bar while a request is in flight */
   #progressBar { transform: scaleX(0); transform-origin: left; transition: transform 220ms ease-out, opacity 220ms; }
   #progressBar.loading { animation: progressGrow 1.4s ease-in-out infinite; }
   @keyframes progressGrow {
@@ -137,7 +128,6 @@
   .fade-page { animation: fadeIn 400ms ease-out both; }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-  /* ===== Suggested slips strip (below header) ===== */
   #suggestedRow { transition: max-height 320ms ease, opacity 260ms ease, padding 320ms ease, border-color 320ms ease; overflow: hidden; }
   #suggestedRow.collapsed { max-height: 0 !important; opacity: 0; padding-top: 0; padding-bottom: 0; border-bottom-color: transparent; }
 
@@ -152,27 +142,24 @@
   .shuffle-spin { transition: transform 420ms cubic-bezier(.2,.9,.25,1.2); }
   .shuffle-spin.spun { transform: rotate(180deg); }
 
-  /* ===== Report request slips (download buttons) ===== */
-  .report-slip {
-    position: relative;
-    overflow: hidden;
-  }
+  .report-slip { position: relative; overflow: hidden; }
   .report-slip::before {
-    content: "";
-    position: absolute; inset: 0;
+    content: ""; position: absolute; inset: 0;
     background: linear-gradient(115deg, transparent 40%, rgba(255,255,255,0.35) 50%, transparent 60%);
     transform: translateX(-120%);
   }
   .report-slip:hover::before { transform: translateX(120%); transition: transform 650ms ease; }
 
-  /* ===== Mic button (voice input) ===== */
-  .mic-btn {
-    position: relative;
-  }
+  .mic-btn { position: relative; transition: all 0.2s ease; }
   .mic-btn.mic-listening {
-    background-color: rgba(178,58,46,0.12) !important;
-    border-color: rgba(178,58,46,0.5) !important;
+    background-color: rgba(178,58,46,0.15) !important;
+    border-color: rgba(178,58,46,0.6) !important;
     color: #B23A2E !important;
+  }
+  .mic-btn.conv-active {
+    background-color: rgba(47,93,80,0.12) !important;
+    border-color: rgba(47,93,80,0.6) !important;
+    color: #2F5D50 !important;
   }
   .mic-ring {
     position: absolute; inset: -3px; border-radius: 9999px;
@@ -185,22 +172,64 @@
     70%  { opacity: 0; transform: scale(1.55); }
     100% { opacity: 0; transform: scale(1.55); }
   }
-  #micStatusToast {
-    transition: opacity 200ms ease, transform 200ms ease;
+  #micStatusToast { transition: opacity 200ms ease, transform 200ms ease; }
+
+  .xref-note {
+    display: flex; align-items: flex-start; gap: 6px;
+    background: rgba(169,128,61,0.08);
+    border: 1px dashed rgba(169,128,61,0.45);
+    border-radius: 2px;
+    padding: 6px 10px;
+    margin-bottom: 10px;
   }
+
+  .followup-chip {
+    animation: chipIn 320ms ease-out both;
+    animation-delay: calc(var(--i, 0) * 60ms);
+  }
+  .followup-chip:active { transform: translateY(1px) scale(0.98); }
+
+  .session-badge { letter-spacing: 0.06em; }
+
+  .speak-btn { position: relative; }
+  .speak-btn.speaking {
+    background-color: rgba(47,93,80,0.15) !important;
+    border-color: rgba(47,93,80,0.6) !important;
+    color: #22443B !important;
+  }
+  .speak-ring {
+    position: absolute; inset: -3px; border-radius: 9999px;
+    border: 2px solid rgba(47,93,80,0.55);
+    opacity: 0; pointer-events: none;
+  }
+  .speaking .speak-ring { animation: speakPulse 1.2s ease-out infinite; }
+  @keyframes speakPulse {
+    0%   { opacity: 0.7; transform: scale(0.85); }
+    70%  { opacity: 0; transform: scale(1.4); }
+    100% { opacity: 0; transform: scale(1.4); }
+  }
+  .speak-bars { display: inline-flex; align-items: flex-end; gap: 1.5px; height: 12px; }
+  .speak-bars span {
+    width: 2px; background: currentColor; border-radius: 1px;
+    animation: barsIdle 1.4s ease-in-out infinite;
+  }
+  .speak-bars span:nth-child(1) { height: 5px;  animation-delay: 0ms; }
+  .speak-bars span:nth-child(2) { height: 10px; animation-delay: 150ms; }
+  .speak-bars span:nth-child(3) { height: 7px;  animation-delay: 300ms; }
+  .speak-bars span:nth-child(4) { height: 11px; animation-delay: 450ms; }
+  @keyframes barsIdle { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }
+  .speaking .speak-bars span { animation-duration: 0.55s; }
 </style>
 </head>
 
 <body class="font-body text-graphite">
 
-<!-- top progress bar -->
 <div class="fixed top-0 left-0 right-0 h-[3px] z-50 bg-transparent">
   <div id="progressBar" class="h-full bg-shelf opacity-0"></div>
 </div>
 
 <div class="h-screen w-screen flex overflow-hidden fade-page">
 
-  <!-- ============ SIDEBAR: CARD CATALOG DRAWER ============ -->
   <aside id="sidebar"
     class="fixed lg:static z-30 h-full w-[280px] shrink-0 -translate-x-full lg:translate-x-0 transition-transform duration-300 flex flex-col drawer-wood shadow-2xl">
 
@@ -236,22 +265,22 @@
         <ol class="space-y-2.5">
           <li class="flex gap-2.5 items-start">
             <span class="mt-0.5 shrink-0 w-4 h-4 rounded-full bg-gold/25 border border-gold/50 flex items-center justify-center font-mono text-[8.5px] text-cream/85">1</span>
-            <span class="font-body text-[12.5px] text-cream/70 leading-snug">Ask a question in plain English or Hindi — type or speak.</span>
+            <span class="font-body text-[12.5px] text-cream/70 leading-snug">Click the mic once to start a hands-free conversation.</span>
           </li>
           <li class="flex gap-2.5 items-start">
             <span class="mt-0.5 shrink-0 w-4 h-4 rounded-full bg-gold/25 border border-gold/50 flex items-center justify-center font-mono text-[8.5px] text-cream/85">2</span>
-            <span class="font-body text-[12.5px] text-cream/70 leading-snug">The desk drafts and indexes a SQL query.</span>
+            <span class="font-body text-[12.5px] text-cream/70 leading-snug">Ask your question. When you pause, it auto-submits and the assistant reads the answer aloud.</span>
           </li>
           <li class="flex gap-2.5 items-start">
             <span class="mt-0.5 shrink-0 w-4 h-4 rounded-full bg-gold/25 border border-gold/50 flex items-center justify-center font-mono text-[8.5px] text-cream/85">3</span>
-            <span class="font-body text-[12.5px] text-cream/70 leading-snug">Get an answer, an optional chart, and downloadable reports.</span>
+            <span class="font-body text-[12.5px] text-cream/70 leading-snug">As soon as the voice ends, the mic auto-turns on for your next question. Click mic again to stop.</span>
           </li>
         </ol>
       </div>
 
       <div class="pt-1 border-t border-white/10">
         <p class="font-mono text-[10px] uppercase tracking-[0.2em] text-cream/55 mb-2 mt-4">Tip</p>
-        <p class="font-body text-[12.5px] text-cream/60 leading-relaxed">Tap the mic next to the send button and speak your question — it'll type itself. Suggested slips live just under the header too.</p>
+        <p class="font-body text-[12.5px] text-cream/60 leading-relaxed">Make sure to select "Allow while visiting the site" when the browser asks for mic permission so it doesn't prompt you repeatedly.</p>
       </div>
     </div>
 
@@ -260,12 +289,14 @@
         Connected to <span class="text-cream/75" id="apiBaseLabel">localhost:7698</span><br/>
         Text-to-SQL agent · SOUL 3.0 Library System
       </p>
+      <p class="font-mono text-[9px] leading-relaxed text-cream/45 mt-2">
+        Drawer session: <span id="sessionIdLabel" class="session-badge text-cream/70">—</span>
+      </p>
     </div>
   </aside>
 
   <div id="backdrop" class="hidden fixed inset-0 bg-black/40 z-20 lg:hidden"></div>
 
-  <!-- ============ MAIN ============ -->
   <div class="flex-1 flex flex-col min-w-0 relative">
 
     <header class="flex items-center justify-between gap-3 px-4 sm:px-8 py-4 border-b border-line/70 bg-paper/70 backdrop-blur">
@@ -275,16 +306,29 @@
         </button>
         <div class="min-w-0">
           <h1 class="font-display text-xl sm:text-2xl text-ink truncate">Ask the Reference Desk</h1>
-          <p class="font-mono text-[11px] text-graphite/55 truncate hidden sm:block">Natural language in — indexed T-SQL answers out</p>
+          <p class="font-mono text-[11px] text-graphite/55 truncate hidden sm:block">Natural language in — indexed T-SQL answers, read aloud</p>
         </div>
       </div>
-      <button id="newSessionBtn" class="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide text-shelf border border-shelf/40 px-3 py-1.5 rounded-sm hover:bg-shelf hover:text-cream transition-colors shrink-0">
-        <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
-        <span class="hidden sm:inline">New drawer</span>
-      </button>
+      <div class="flex items-center gap-2 shrink-0">
+        <button id="voiceToggleBtn" type="button" title="Voice replies on/off"
+          class="relative w-9 h-9 rounded-sm border border-line flex items-center justify-center text-shelf hover:bg-shelf/10 transition-colors"
+          aria-pressed="true" aria-label="Toggle voice replies">
+          <svg id="voiceOnIcon" viewBox="0 0 24 24" class="w-4.5 h-4.5" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 5 6 9H3v6h3l5 4V5Z" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <svg id="voiceOffIcon" viewBox="0 0 24 24" class="w-4.5 h-4.5 hidden" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 5 6 9H3v6h3l5 4V5Z" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M16 9l5 6M21 9l-5 6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="newSessionBtn" class="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide text-shelf border border-shelf/40 px-3 py-1.5 rounded-sm hover:bg-shelf hover:text-cream transition-colors">
+          <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+          <span class="hidden sm:inline">New drawer</span>
+        </button>
+      </div>
     </header>
 
-    <!-- ============ SUGGESTED SLIPS — below header, dynamic, full width ============ -->
     <div id="suggestedRow" class="border-b border-line/70 bg-gradient-to-b from-gold/[0.07] to-transparent px-4 sm:px-8 py-3">
       <div class="max-w-6xl mx-auto flex items-start gap-3">
         <button id="shuffleBtn" type="button" title="Shuffle slips" aria-label="Shuffle suggested slips"
@@ -292,7 +336,6 @@
           <svg class="shuffle-spin w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M4 4h4l6 8 6 8h-4" stroke-linecap="round" stroke-linejoin="round"/>
             <path d="M4 20h4l2.6-3.5" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M14 4h6v6M4 4l6 6" stroke-linecap="round" stroke-linejoin="round" opacity="0"/>
           </svg>
         </button>
         <div id="suggestedChips" class="flex-1 flex flex-wrap items-stretch gap-2"></div>
@@ -307,22 +350,27 @@
       <div id="chatInner" class="max-w-6xl mx-auto flex flex-col gap-6 pb-4"></div>
     </main>
 
-    <!-- scroll-to-latest -->
     <button id="scrollLatestBtn" class="hidden absolute bottom-24 right-6 sm:right-10 items-center gap-1.5 bg-ink text-cream font-mono text-[10px] uppercase tracking-wide px-3 py-2 rounded-full shadow-card hover:bg-shelfdk transition-colors">
       <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M6 13l6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Latest
     </button>
 
-    <!-- resurface suggested slips after they've been hidden -->
     <button id="showSuggestedBtn" class="hidden absolute top-3 right-6 sm:right-10 items-center gap-1.5 bg-cream border border-gold/40 text-graphite/70 font-mono text-[10px] uppercase tracking-wide px-3 py-1.5 rounded-full shadow-card hover:text-ink hover:border-gold transition-colors">
       <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M13 5l-2 14" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Slips
     </button>
 
-    <!-- mic status toast -->
     <div id="micStatusToast" class="hidden absolute bottom-24 left-1/2 -translate-x-1/2 items-center gap-2 bg-ink text-cream font-mono text-[10.5px] uppercase tracking-wide px-3.5 py-2 rounded-full shadow-card opacity-0 pointer-events-none">
       <span class="w-1.5 h-1.5 rounded-full bg-stamp animate-pulse"></span>
       <span id="micStatusText">Listening…</span>
+    </div>
+
+    <div id="speakingToast" class="hidden absolute bottom-24 left-1/2 -translate-x-1/2 items-center gap-2 bg-shelf text-cream font-mono text-[10.5px] uppercase tracking-wide px-3.5 py-2 rounded-full shadow-card opacity-0 pointer-events-none">
+      <span class="speak-bars text-cream">
+        <span></span><span></span><span></span><span></span>
+      </span>
+      <span>Reading answer…</span>
+      <button id="stopSpeakBtn" type="button" class="ml-1 underline decoration-cream/40 hover:decoration-cream">Stop</button>
     </div>
 
     <footer class="border-t border-line/70 bg-paper/80 backdrop-blur px-4 sm:px-8 py-4">
@@ -335,7 +383,7 @@
             class="flex-1 resize-none bg-transparent max-h-40 py-2 px-1 font-body text-[15px] text-graphite placeholder:text-graphite/40"
             aria-label="Ask a question"
           ></textarea>
-          <button id="micBtn" type="button" title="Speak your question" aria-label="Speak your question"
+          <button id="micBtn" type="button" title="Start/Stop Voice Conversation" aria-label="Start or stop voice conversation"
             class="mic-btn shrink-0 flex items-center justify-center w-10 h-10 rounded-sm border border-line text-graphite/60 hover:text-shelf hover:border-shelf/50 transition-colors">
             <span class="mic-ring"></span>
             <svg id="micIcon" viewBox="0 0 24 24" class="w-4.5 h-4.5" fill="none" stroke="currentColor" stroke-width="2">
@@ -349,7 +397,7 @@
             <svg id="sendIcon" viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
-        <p class="font-mono text-[10px] text-graphite/45 mt-1.5 px-1">Enter to send · Shift+Enter for a new line · Tap the mic to speak (English or Hindi)</p>
+        <p class="font-mono text-[10px] text-graphite/45 mt-1.5 px-1">Click mic for hands-free chat · Enter to send text · Speaker (top-right) toggles voice replies</p>
       </form>
     </footer>
   </div>
@@ -359,9 +407,6 @@
 (function () {
   "use strict";
 
-  // ---------------------------------------------------------
-  // CONFIG
-  // ---------------------------------------------------------
   const API_BASE = "http://localhost:7698";
   const FALLBACK_QUESTIONS = [
     "Library me total kitni physical books hain aur usme se kitni unique titles hain? Sirf count batao.",
@@ -371,13 +416,18 @@
     "Computer Centre department me kitne active students hain? Naam aur member ID list karo.",
     "Pichle 1 saal me sabse zyada issue ki gayi 3 books kaun si hain?"
   ];
-  const CHIP_MAX_COUNT = 8; // safety cap if the backend ever sends a huge list
+  const CHIP_MAX_COUNT = 8;
 
   marked.setOptions({ breaks: true, gfm: true });
 
-  // ---------------------------------------------------------
-  // ELEMENTS
-  // ---------------------------------------------------------
+  function generateThreadId() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+    return "thread-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  }
+  let currentThreadId = generateThreadId();
+
   const chatInner        = document.getElementById("chatInner");
   const chatArea         = document.getElementById("chatArea");
   const form              = document.getElementById("composerForm");
@@ -402,12 +452,129 @@
   const shuffleBtn        = document.getElementById("shuffleBtn");
   const hideSuggestedBtn  = document.getElementById("hideSuggestedBtn");
   const showSuggestedBtn  = document.getElementById("showSuggestedBtn");
+  const sessionIdLabel    = document.getElementById("sessionIdLabel");
+  const voiceToggleBtn    = document.getElementById("voiceToggleBtn");
+  const voiceOnIcon       = document.getElementById("voiceOnIcon");
+  const voiceOffIcon      = document.getElementById("voiceOffIcon");
+  const speakingToast     = document.getElementById("speakingToast");
+  const stopSpeakBtn      = document.getElementById("stopSpeakBtn");
   document.getElementById("apiBaseLabel").textContent = API_BASE.replace(/^https?:\/\//, "");
+
+  function renderSessionBadge() {
+    sessionIdLabel.textContent = currentThreadId.slice(0, 8);
+    sessionIdLabel.title = currentThreadId;
+  }
+  renderSessionBadge();
 
   let cardCounter = 0;
   let busy = false;
   let userScrolledUp = false;
   let allQuestions = FALLBACK_QUESTIONS.slice();
+
+  let currentAudio = null;
+  let currentSpeakBtn = null;
+  let voiceEnabled = true;
+  let voiceConversationActive = false;
+
+  function setVoiceEnabled(on) {
+    voiceEnabled = on;
+    voiceToggleBtn.setAttribute("aria-pressed", on ? "true" : "false");
+    voiceToggleBtn.title = on ? "Voice replies ON — click to mute" : "Voice replies OFF — click to unmute";
+    voiceOnIcon.classList.toggle("hidden", !on);
+    voiceOffIcon.classList.toggle("hidden", on);
+    if (!on) stopAllAudio();
+  }
+  setVoiceEnabled(true);
+
+  voiceToggleBtn.addEventListener("click", () => setVoiceEnabled(!voiceEnabled));
+
+  function showSpeakingToast() {
+    speakingToast.classList.remove("hidden");
+    speakingToast.classList.add("flex");
+    requestAnimationFrame(() => { speakingToast.style.opacity = "1"; });
+  }
+  function hideSpeakingToast() {
+    speakingToast.style.opacity = "0";
+    setTimeout(() => {
+      speakingToast.classList.add("hidden");
+      speakingToast.classList.remove("flex");
+    }, 200);
+  }
+  stopSpeakBtn.addEventListener("click", () => stopAllAudio());
+
+  function stopAllAudio() {
+    if (currentAudio) {
+      try { currentAudio.pause(); } catch (e) {}
+      try { currentAudio.src = ""; } catch (e) {}
+      currentAudio = null;
+    }
+    if (currentSpeakBtn) {
+      currentSpeakBtn.classList.remove("speaking");
+      currentSpeakBtn = null;
+    }
+    hideSpeakingToast();
+  }
+
+  function playAnswerAudio(audioBase64, speakBtn) {
+    if (!audioBase64) {
+      if (voiceConversationActive) {
+        setTimeout(() => startListening(), 1500);
+      }
+      return;
+    }
+    
+    stopAllAudio();
+
+    try {
+      const audio = new Audio("data:audio/mpeg;base64," + audioBase64);
+      currentAudio = audio;
+      currentSpeakBtn = speakBtn || null;
+
+      if (speakBtn) speakBtn.classList.add("speaking");
+      showSpeakingToast();
+
+      audio.onended = () => {
+        if (speakBtn) speakBtn.classList.remove("speaking");
+        if (currentSpeakBtn === speakBtn) currentSpeakBtn = null;
+        if (currentAudio === audio) currentAudio = null;
+        hideSpeakingToast();
+        
+        if (voiceConversationActive) {
+          setTimeout(() => startListening(), 500);
+        }
+      };
+      
+      audio.onerror = () => {
+        if (speakBtn) speakBtn.classList.remove("speaking");
+        if (currentSpeakBtn === speakBtn) currentSpeakBtn = null;
+        if (currentAudio === audio) currentAudio = null;
+        hideSpeakingToast();
+        
+        if (voiceConversationActive) {
+          setTimeout(() => startListening(), 1000);
+        }
+      };
+
+      const p = audio.play();
+      if (p && typeof p.then === "function") {
+        p.catch((err) => {
+          console.warn("[TTS] Autoplay blocked:", err);
+          if (speakBtn) speakBtn.classList.remove("speaking");
+          if (currentSpeakBtn === speakBtn) currentSpeakBtn = null;
+          if (currentAudio === audio) currentAudio = null;
+          hideSpeakingToast();
+        });
+      }
+    } catch (e) {
+      console.error("[TTS] Could not play audio:", e);
+      hideSpeakingToast();
+      if (voiceConversationActive) {
+        setTimeout(() => startListening(), 1500);
+      }
+    }
+  }
+
+  function interruptAudio() { stopAllAudio(); }
 
   function shuffleArray(arr) {
     const a = arr.slice();
@@ -418,18 +585,12 @@
     return a;
   }
 
-  // ---------------------------------------------------------
-  // SIDEBAR TOGGLE (mobile)
-  // ---------------------------------------------------------
   function openSidebar() { sidebar.classList.remove("-translate-x-full"); backdrop.classList.remove("hidden"); }
   function closeSidebar() { sidebar.classList.add("-translate-x-full"); backdrop.classList.add("hidden"); }
   menuBtn.addEventListener("click", openSidebar);
   closeSidebarBtn.addEventListener("click", closeSidebar);
   backdrop.addEventListener("click", closeSidebar);
 
-  // ---------------------------------------------------------
-  // TEXTAREA AUTOSIZE + SEND BUTTON ENABLE STATE
-  // ---------------------------------------------------------
   function resizeInput() {
     input.style.height = "auto";
     input.style.height = Math.min(input.scrollHeight, 160) + "px";
@@ -445,9 +606,6 @@
     }
   });
 
-  // ---------------------------------------------------------
-  // SCROLL TRACKING (scroll-to-latest button)
-  // ---------------------------------------------------------
   chatArea.addEventListener("scroll", () => {
     const distanceFromBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight;
     userScrolledUp = distanceFromBottom > 160;
@@ -461,9 +619,6 @@
     chatArea.scrollTo({ top: chatArea.scrollHeight, behavior: "smooth" });
   }
 
-  // ---------------------------------------------------------
-  // TOP PROGRESS BAR
-  // ---------------------------------------------------------
   function progressStart() {
     progressBar.style.opacity = "1";
     progressBar.classList.add("loading");
@@ -477,14 +632,12 @@
     }, 260);
   }
 
-  // ---------------------------------------------------------
-  // VOICE INPUT (Web Speech API) — mic types into the textarea
-  // ---------------------------------------------------------
+  // --- VOICE INPUT LOGIC ---
   const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
   let recognition = null;
   let listening = false;
-  let baseTextBeforeListening = ""; // text already in the box when mic was pressed
-  let interimStartLength = 0;
+  let baseTextBeforeListening = "";
+  let silenceTimer = null;
 
   function showMicToast(message) {
     micStatusText.textContent = message;
@@ -503,9 +656,11 @@
   function setListeningUI(isListening) {
     listening = isListening;
     micBtn.classList.toggle("mic-listening", isListening);
+    micBtn.classList.toggle("conv-active", voiceConversationActive && !isListening);
     micBtn.setAttribute("aria-pressed", isListening ? "true" : "false");
     if (isListening) {
       showMicToast("Listening… bolna shuru karein");
+      interruptAudio();
     } else {
       hideMicToast();
     }
@@ -516,12 +671,12 @@
     const rec = new SpeechRecognitionCtor();
     rec.continuous = true;
     rec.interimResults = true;
-    // Hindi first since prompts here are Hinglish; browsers using this recognizer
-    // generally still pick up English speech reasonably under hi-IN.
     rec.lang = "hi-IN";
 
     rec.onstart = () => {
-      baseTextBeforeListening = input.value ? (input.value.replace(/\s+$/,"") + " ") : "";
+      baseTextBeforeListening = "";
+      input.value = "";
+      resizeInput();
       setListeningUI(true);
     };
 
@@ -536,9 +691,17 @@
           interimChunk += result[0].transcript;
         }
       }
+      
       if (finalChunk) {
-        baseTextBeforeListening = (baseTextBeforeListening + finalChunk).replace(/\s+$/, "") + " ";
+        baseTextBeforeListening += finalChunk;
       }
+      if (interimChunk) {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(() => {
+          try { recognition.stop(); } catch(e) {}
+        }, 1500);
+      }
+      
       input.value = (baseTextBeforeListening + interimChunk).trim();
       resizeInput();
       sendBtn.disabled = !input.value.trim() || busy;
@@ -547,44 +710,78 @@
     rec.onerror = (event) => {
       let msg = "Mic error — try again.";
       if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-        msg = "Mic access blocked — allow microphone permission and retry.";
+        msg = "Mic permission blocked. Please click 'Allow while visiting the site'.";
+        voiceConversationActive = false; // Stop loop on permission error
+        setListeningUI(false);
       } else if (event.error === "no-speech") {
         msg = "Didn't catch that — try speaking again.";
       } else if (event.error === "network") {
         msg = "Network issue with voice recognition.";
+      } else if (event.error === "aborted") {
+        // silent abort, no toast needed
+        return;
       }
       showMicToast(msg);
-      setTimeout(hideMicToast, 2200);
+      setTimeout(hideMicToast, 3000);
     };
 
     rec.onend = () => {
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
       setListeningUI(false);
-      input.focus();
+      
+      if (baseTextBeforeListening.trim() && voiceConversationActive) {
+        const q = input.value;
+        input.value = "";
+        input.style.height = "auto";
+        sendBtn.disabled = true;
+        sendQuestion(q);
+      } else if (voiceConversationActive && !busy) {
+        setTimeout(() => startListening(), 500);
+      }
+      baseTextBeforeListening = "";
     };
 
     return rec;
   }
 
+  function startListening() {
+    if (busy || listening) return; // Prevent double start
+    if (!recognition) recognition = initRecognition();
+    if (!recognition) return;
+    try {
+      recognition.start();
+    } catch (e) {
+      console.warn("Recognition start error:", e);
+      // If it's already started, just ignore
+      if (e.name !== 'InvalidStateError') {
+        showMicToast("Mic issue. Retrying...");
+        setTimeout(hideMicToast, 2000);
+      }
+    }
+  }
+
+  function stopVoiceConversation() {
+    voiceConversationActive = false;
+    stopAllAudio();
+    if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+    if (listening && recognition) {
+      try { recognition.stop(); } catch(e) {}
+    }
+    setListeningUI(false);
+  }
+
   function toggleListening() {
     if (!SpeechRecognitionCtor) {
       showMicToast("Voice input isn't supported in this browser — try Chrome.");
-      setTimeout(hideMicToast, 2600);
+      setTimeout(hideMicToast, 3000);
       return;
     }
-    if (busy) return;
-
-    if (!recognition) recognition = initRecognition();
-    if (!recognition) return;
-
-    if (listening) {
-      recognition.stop();
+    
+    if (voiceConversationActive) {
+      stopVoiceConversation();
     } else {
-      try {
-        recognition.start();
-      } catch (e) {
-        // start() throws if already started — restart cleanly
-        try { recognition.stop(); } catch (e2) {}
-      }
+      voiceConversationActive = true;
+      startListening();
     }
   }
 
@@ -596,9 +793,6 @@
     micBtn.addEventListener("click", toggleListening);
   }
 
-  // ---------------------------------------------------------
-  // HEALTH CHECK (robust: treats any successful round trip as "online" too)
-  // ---------------------------------------------------------
   function setStatus(online) {
     if (online) {
       statusDot.className = "w-2 h-2 rounded-full bg-shelf pulse-dot";
@@ -622,19 +816,13 @@
   checkHealth();
   setInterval(checkHealth, 20000);
 
-  // ---------------------------------------------------------
-  // UTIL
-  // ---------------------------------------------------------
   function escapeHtml(str) {
     const div = document.createElement("div");
     div.textContent = str;
     return div.innerHTML;
   }
-
-  function truncate(str, n) {
-    return str.length > n ? str.slice(0, n - 1).trim() + "…" : str;
-  }
-
+  function truncate(str, n) { return str.length > n ? str.slice(0, n - 1).trim() + "…" : str; }
+  function normalize(str) { return (str || "").trim().toLowerCase().replace(/\s+/g, " "); }
   function nowParts() {
     const d = new Date();
     return {
@@ -645,9 +833,6 @@
     };
   }
 
-  // ---------------------------------------------------------
-  // SUGGESTED SLIPS — dynamic strip below header
-  // ---------------------------------------------------------
   function renderChips() {
     suggestedChips.innerHTML = "";
     if (!allQuestions.length) {
@@ -660,9 +845,7 @@
       chip.type = "button";
       chip.style.setProperty("--i", i);
       chip.className = "slip-chip flex items-center gap-2 bg-paper hover:bg-cream border border-line hover:border-gold/60 rounded-full pl-3 pr-3.5 py-2 shadow-sm hover:shadow-card transition-colors basis-full sm:basis-[calc(50%-0.25rem)] xl:basis-[calc(25%-0.375rem)]";
-      chip.innerHTML = `
-        <svg class="w-3.5 h-3.5 text-gold shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3v5h5M6 3h8l6 6v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke-linejoin="round"/></svg>
-        <span class="font-body text-[12.5px] text-graphite/85 truncate">${escapeHtml(truncate(q, 76))}</span>`;
+      chip.innerHTML = `<svg class="w-3.5 h-3.5 text-gold shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3v5h5M6 3h8l6 6v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke-linejoin="round"/></svg><span class="font-body text-[12.5px] text-graphite/85 truncate">${escapeHtml(truncate(q, 76))}</span>`;
       chip.title = q;
       chip.addEventListener("click", () => {
         input.value = q;
@@ -709,9 +892,6 @@
   }
   loadCatalog();
 
-  // ---------------------------------------------------------
-  // RENDER: WELCOME EMPTY STATE
-  // ---------------------------------------------------------
   function renderEmptyState() {
     const el = document.createElement("div");
     el.id = "emptyState";
@@ -725,20 +905,13 @@
       </div>
       <div>
         <p class="font-display text-xl text-ink">The drawer is open.</p>
-        <p class="font-body text-sm text-graphite/60 mt-1 max-w-sm mx-auto">Ask about members, issued books, overdue titles, subjects, or request a chart — tap a slip above, type, or tap the mic to speak.</p>
+        <p class="font-body text-sm text-graphite/60 mt-1 max-w-sm mx-auto">Ask about members, issued books, overdue titles, subjects, or request a chart. Click the mic for a hands-free voice chat!</p>
       </div>`;
     chatInner.appendChild(el);
   }
   renderEmptyState();
+  function clearEmptyState() { const el = document.getElementById("emptyState"); if (el) el.remove(); }
 
-  function clearEmptyState() {
-    const el = document.getElementById("emptyState");
-    if (el) el.remove();
-  }
-
-  // ---------------------------------------------------------
-  // RENDER: USER SLIP
-  // ---------------------------------------------------------
   function renderUserSlip(question) {
     clearEmptyState();
     const wrap = document.createElement("div");
@@ -754,9 +927,6 @@
     scrollToBottom(true);
   }
 
-  // ---------------------------------------------------------
-  // RENDER: LOADING CARD
-  // ---------------------------------------------------------
   function renderLoadingCard() {
     const wrap = document.createElement("div");
     wrap.className = "flex justify-start card-enter";
@@ -775,17 +945,19 @@
     return wrap;
   }
 
-  // ---------------------------------------------------------
-  // RENDER: CATALOG (ASSISTANT) CARD
-  // ---------------------------------------------------------
-  function renderAssistantCard({ answer, sql_query, chart_base64, attempts, debug_error, report_available, report_id }) {
+  function renderAssistantCard({ question, resolved_question, answer, sql_query, chart_base64, audio_base64, image_data, attempts, debug_error, report_available, report_id, suggested_followups }) {
     cardCounter += 1;
     const cardId = "card-" + cardCounter;
-    const hasChart = !!chart_base64;
-    const hasError = !!debug_error;
+    const hasChart  = !!chart_base64;
+    const hasAudio  = !!audio_base64;
+    const hasError  = !!debug_error;
     const hasReport = !!(report_available && report_id);
+    const hasImages = Array.isArray(image_data) && image_data.length > 0;
+    const followups = Array.isArray(suggested_followups) ? suggested_followups.filter(q => q && q.trim()) : [];
+    const hasFollowups = followups.length > 0;
     const callNo = "LIB." + String(cardCounter).padStart(3, "0");
     const t = nowParts();
+    const showXref = resolved_question && normalize(resolved_question) !== normalize(question);
 
     const wrap = document.createElement("div");
     wrap.className = "flex justify-start card-enter";
@@ -795,9 +967,36 @@
       ? "stamp fire border-2 border-stamp text-stamp rounded-full w-[88px] h-[88px] flex flex-col items-center justify-center gap-0.5 bg-paper/70 backdrop-blur-[1px]"
       : "stamp fire border-2 border-shelf text-shelf rounded-full w-[88px] h-[88px] flex flex-col items-center justify-center gap-0.5 bg-paper/70 backdrop-blur-[1px]";
 
+    let imagesHtml = "";
+    if (hasImages) {
+      imagesHtml = `
+        <div class="mt-4 pt-3 border-t border-dashed border-line">
+          <p class="font-mono text-[10px] uppercase tracking-[0.14em] text-graphite/45 mb-3">Attached Images</p>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            ${image_data.map(img => `
+              <div class="bg-cream border border-line rounded-sm p-3 flex flex-col gap-2 shadow-sm">
+                <div class="flex items-center justify-between pb-1 border-b border-dashed border-line/60">
+                  <span class="font-mono text-[10px] uppercase tracking-wide text-gold">${escapeHtml(img.label || 'Image')}</span>
+                  ${img.member_name ? `<span class="font-body text-[12px] font-medium text-graphite/85">${escapeHtml(img.member_name)}</span>` : ''}
+                </div>
+                <div class="flex justify-center items-center bg-paper/50 p-2 rounded-sm min-h-[120px]">
+                  <img src="${img.base64}" alt="${escapeHtml(img.label || 'Image')}" class="max-h-64 w-auto object-contain rounded-[2px] shadow-sm" loading="lazy" />
+                </div>
+                <div class="flex justify-end">
+                  <a href="${img.base64}" download="${escapeHtml((img.label || 'image').replace(/\s+/g, '_').toLowerCase())}.jpg" class="font-mono text-[10px] uppercase tracking-wide text-shelf hover:text-shelfdk flex items-center gap-1">
+                    <svg viewBox="0 0 24 24" class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Download
+                  </a>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }
+
     wrap.innerHTML = `
       <div class="relative w-full pt-6 pr-6">
-        <!-- stamp: sits above/outside the card corner, never over content -->
         <div class="stamp-wrap absolute top-0 right-0 z-10">
           <div class="${stampClasses}">
             <span class="font-mono text-[8px] uppercase tracking-[0.1em] leading-none">${hasError ? 'flagged' : 'indexed'}</span>
@@ -809,13 +1008,27 @@
         <div class="punch-wrap relative ruled bg-paper border border-line rounded-sm shadow-card pt-5 pb-4 px-5 sm:px-6">
           <span class="ring-hole"></span>
 
-          <!-- header row -->
           <div class="flex items-center justify-between gap-3 mb-3 pb-2 pl-6 border-b border-dashed border-line">
             <span class="font-mono text-[10px] uppercase tracking-[0.15em] text-gold">Card No. ${callNo}</span>
-            ${attempts ? `<span class="font-mono text-[9px] uppercase tracking-wide text-graphite/40 bg-graphite/5 px-2 py-0.5 rounded-full">${attempts} pass${attempts > 1 ? "es" : ""}</span>` : ``}
+            <div class="flex items-center gap-2">
+              ${hasAudio ? `
+              <button type="button" class="speak-btn flex items-center justify-center w-8 h-8 rounded-sm border border-shelf/30 text-shelf hover:bg-shelf/10 transition-colors" title="Read answer aloud" aria-label="Read answer aloud">
+                <span class="speak-ring"></span>
+                <svg class="speak-icon w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M11 5 6 9H3v6h3l5 4V5Z" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>` : ``}
+              ${attempts ? `<span class="font-mono text-[9px] uppercase tracking-wide text-graphite/40 bg-graphite/5 px-2 py-0.5 rounded-full">${attempts} pass${attempts > 1 ? "es" : ""}</span>` : ``}
+            </div>
           </div>
 
-          <!-- answer -->
+          ${showXref ? `
+          <div class="xref-note">
+            <svg class="w-3.5 h-3.5 text-gold shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M9 12h6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <p class="font-mono text-[10.5px] text-graphite/60 leading-relaxed">Read as: <span class="text-graphite/85">${escapeHtml(resolved_question)}</span></p>
+          </div>` : ``}
+
           <div class="markdown markdown-scroll font-body text-[14.5px] text-graphite leading-relaxed">${marked.parse(answer || "_No answer returned._")}</div>
 
           ${hasError ? `
@@ -835,7 +1048,8 @@
             </div>
           </div>` : ``}
 
-          <!-- Report request slips: Excel / PDF -->
+          ${imagesHtml}
+
           ${hasReport ? `
           <div class="mt-4">
             <p class="font-mono text-[10px] uppercase tracking-[0.14em] text-graphite/45 mb-2">Full report on file — request a copy</p>
@@ -854,7 +1068,6 @@
             <div class="report-status mt-2 hidden"></div>
           </div>` : ``}
 
-          <!-- SQL slip -->
           ${sql_query ? `
           <div class="mt-4">
             <button type="button" class="sql-toggle w-full flex items-center justify-between font-mono text-[11px] uppercase tracking-wide text-shelf hover:text-shelfdk bg-shelf/10 hover:bg-shelf/15 border border-shelf/25 rounded-sm px-3 py-2 transition-colors">
@@ -871,10 +1084,36 @@
               </div>
             </div>
           </div>` : ``}
+
+          ${hasFollowups ? `
+          <div class="mt-4 pt-3 border-t border-dashed border-line">
+            <p class="font-mono text-[10px] uppercase tracking-[0.14em] text-graphite/45 mb-2">Ask next</p>
+            <div class="followup-chips flex flex-wrap gap-2"></div>
+          </div>` : ``}
         </div>
       </div>`;
 
     chatInner.appendChild(wrap);
+
+    if (hasFollowups) {
+      const chipsWrap = wrap.querySelector(".followup-chips");
+      followups.forEach((q, i) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.style.setProperty("--i", i);
+        chip.className = "followup-chip flex items-center gap-1.5 bg-shelf/[0.06] hover:bg-shelf/[0.12] border border-shelf/25 hover:border-shelf/45 rounded-full pl-3 pr-3.5 py-1.5 transition-colors";
+        chip.innerHTML = `<svg class="w-3 h-3 text-shelf shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="font-body text-[12.5px] text-graphite/85">${escapeHtml(q)}</span>`;
+        chip.title = q;
+        chip.addEventListener("click", () => {
+          if (busy) return;
+          input.value = q;
+          input.dispatchEvent(new Event("input"));
+          resizeInput();
+          form.requestSubmit();
+        });
+        chipsWrap.appendChild(chip);
+      });
+    }
 
     const toggleBtn = wrap.querySelector(".sql-toggle");
     if (toggleBtn) {
@@ -893,21 +1132,31 @@
           const original = copyBtn.textContent;
           copyBtn.textContent = "Copied";
           setTimeout(() => (copyBtn.textContent = original), 1500);
-        } catch (e) { /* clipboard unavailable — silently ignore */ }
+        } catch (e) { /* clipboard unavailable */ }
       });
     }
 
-    // Wire up report download buttons — /report/{report_id}/excel and /report/{report_id}/pdf
+    const speakBtn = wrap.querySelector(".speak-btn");
+    if (speakBtn && hasAudio) {
+      speakBtn.addEventListener("click", () => {
+        if (speakBtn.classList.contains("speaking")) {
+          stopAllAudio();
+          return;
+        }
+        playAnswerAudio(audio_base64, speakBtn);
+      });
+    }
+
     if (hasReport) {
       const excelBtn = wrap.querySelector(".excel-btn");
-      const pdfBtn = wrap.querySelector(".pdf-btn");
+      const pdfBtn   = wrap.querySelector(".pdf-btn");
       const statusEl = wrap.querySelector(".report-status");
 
       const showReportStatus = (message, tone) => {
         if (!statusEl) return;
         const tones = {
-          error:   "flex items-start gap-2 bg-stamp/10 border border-stamp/30 text-stamp",
-          info:    "flex items-start gap-2 bg-shelf/10 border border-shelf/30 text-shelfdk",
+          error: "flex items-start gap-2 bg-stamp/10 border border-stamp/30 text-stamp",
+          info:  "flex items-start gap-2 bg-shelf/10 border border-shelf/30 text-shelfdk",
         };
         statusEl.className = "report-status mt-2 rounded-sm px-3 py-2 font-mono text-[11px] leading-relaxed break-words " + (tones[tone] || tones.info);
         statusEl.innerHTML = `<svg viewBox="0 0 24 24" class="w-4 h-4 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke-linecap="round" stroke-linejoin="round"/></svg><span>${escapeHtml(message)}</span>`;
@@ -927,19 +1176,15 @@
 
         try {
           const res = await fetch(url, { method: "GET" });
-
           if (!res.ok) {
             let message = `Report request failed (HTTP ${res.status}).`;
             try {
               const errJson = await res.clone().json();
               if (errJson && errJson.detail) message = errJson.detail;
-            } catch (parseErr) { /* body wasn't JSON — keep the generic message */ }
+            } catch (parseErr) { /* body wasn't JSON */ }
 
             if (res.status === 404 || /expired|not found/i.test(message)) {
-              showReportStatus(
-                `${message} Reports are generated per query and expire after a while — ask the question again to regenerate a fresh copy.`,
-                "error"
-              );
+              showReportStatus(`${message} Reports are generated per query and expire after a while — ask the question again to regenerate a fresh copy.`, "error");
             } else {
               showReportStatus(message, "error");
             }
@@ -980,18 +1225,23 @@
     }
 
     scrollToBottom();
+
+    if (hasAudio && voiceEnabled) {
+      setTimeout(() => playAnswerAudio(audio_base64, speakBtn || null), 250);
+    } else if (voiceConversationActive) {
+      setTimeout(() => startListening(), 1500);
+    }
   }
 
-  // ---------------------------------------------------------
-  // SEND FLOW
-  // ---------------------------------------------------------
   async function sendQuestion(question) {
     if (busy || !question.trim()) return;
     busy = true;
     sendBtn.disabled = true;
     sendLabel.textContent = "Filing…";
-    if (micBtn) micBtn.disabled = true;
+    if (micBtn && !voiceConversationActive) micBtn.disabled = true;
+    
     progressStart();
+    interruptAudio();
 
     renderUserSlip(question);
     const loadingCard = renderLoadingCard();
@@ -1000,7 +1250,7 @@
       const res = await fetch(API_BASE + "/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, thread_id: currentThreadId }),
       });
 
       if (!res.ok) {
@@ -1011,27 +1261,40 @@
       const data = await res.json();
       loadingCard.remove();
       renderAssistantCard({
+        question: data.question || question,
+        resolved_question: data.resolved_question || "",
         answer: data.answer,
         sql_query: data.sql_query,
         chart_base64: data.chart_base64,
+        audio_base64: data.audio_base64,
+        image_data: data.image_data,
         attempts: data.attempts,
         debug_error: data.debug_error,
         report_available: data.report_available,
         report_id: data.report_id,
+        suggested_followups: data.suggested_followups || [],
       });
       setStatus(true);
     } catch (err) {
       loadingCard.remove();
       renderAssistantCard({
+        question,
+        resolved_question: "",
         answer: `**Could not reach the reference desk.**\n\nMake sure the backend is running and CORS is enabled:\n\n\`uvicorn main:app --reload --port 7698\`\n\nDetails: ${err.message || err}`,
         sql_query: "",
         chart_base64: null,
+        audio_base64: null,
+        image_data: null,
         attempts: 0,
         debug_error: err.message || String(err),
         report_available: false,
         report_id: null,
       });
       setStatus(false);
+      
+      if (voiceConversationActive) {
+        setTimeout(() => startListening(), 1500);
+      }
     } finally {
       busy = false;
       sendBtn.disabled = !input.value.trim();
@@ -1053,6 +1316,14 @@
   });
 
   newSessionBtn.addEventListener("click", () => {
+    const oldThreadId = currentThreadId;
+
+    fetch(API_BASE + "/reset-memory/" + encodeURIComponent(oldThreadId), { method: "POST" }).catch(() => {});
+    stopVoiceConversation();
+
+    currentThreadId = generateThreadId();
+    renderSessionBadge();
+
     chatInner.innerHTML = "";
     cardCounter = 0;
     userScrolledUp = false;
