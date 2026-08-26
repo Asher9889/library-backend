@@ -48,6 +48,7 @@ class Settings:
     tts_voice: str
     tts_speed: float
     tts_sample_rate: int
+    debug_dump_audio: bool
     library_agent_url: str
     library_agent_timeout: float
     token_ttl_seconds: int
@@ -64,12 +65,13 @@ settings = Settings(
     agent_logs=_get_bool("LIVEKIT_AGENT_LOGS", True),
     groq_api_key=_get("GROQ_API_KEY"),
     groq_model=_get("GROQ_MODEL", "llama-3.3-70b-versatile"),
-    stt_url=_get("STT_URL", "http://localhost:8000").rstrip("/"),
-    tts_url=_get("TTS_URL", "http://localhost:8001").rstrip("/"),
+    stt_url=_get("STT_SERVER_URL", "http://localhost:8000").rstrip("/"),
+    tts_url=_get("TTS_SERVER_URL", "http://localhost:8001").rstrip("/"),
     tts_language=_get("TTS_LANGUAGE", "hi"),
     tts_voice=_get("TTS_VOICE", "hm_psi"),
     tts_speed=_get_float("TTS_SPEED", 1.0),
     tts_sample_rate=_get_int("TTS_SAMPLE_RATE", 44100),
+    debug_dump_audio=_get_bool("DEBUG_DUMP_AUDIO", False),
     library_agent_url=_get("LIBRARY_AGENT_URL", "http://localhost:7698").rstrip("/"),
     library_agent_timeout=_get_float("LIBRARY_AGENT_TIMEOUT", 60.0),
     token_ttl_seconds=_get_int("LIVEKIT_TOKEN_TTL", 3600),

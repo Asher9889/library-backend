@@ -1,5 +1,14 @@
 import os
 import time
+import cv2
+import numpy as np
+import torch
+import psutil
+import asyncio
+from torchvision import transforms
+from concurrent.futures import ThreadPoolExecutor
+from face_detection.scrfd.detector import SCRFD
+from face_recognition.arcface.model import iresnet_inference
 import re
 import ast
 import io
@@ -15,7 +24,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 import pyodbc
 import groq
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +43,12 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.units import inch
 
+# from dotenv import load_dotenv
+
+# load_dotenv()
+
+
+
 checkpointer = MemorySaver()
 
 # ==========================================
@@ -48,7 +63,7 @@ from livekit_agent.tokens import create_join_token, dispatch_agent, generate_roo
 # NOTE: Move these to real environment variables / a secrets manager before
 # deploying. Hardcoded DB + API credentials in source is a security risk,
 # especially since this file will end up in git history / logs.
-os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
+# os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
 
 
 def _resolve_odbc_driver() -> str:
@@ -151,7 +166,13 @@ def is_backup_table(name: str) -> bool:
     return False
 
 def create_connection():
-    return pyodbc.connect(CONNECTION_STRING)
+    # autocommit=True is important: without it, pyodbc opens every
+    # connection in manual-transaction mode. Since this app never calls
+    # conn.commit(), every INSERT/UPDATE (e.g. face registration) stayed
+    # in an open, never-committed transaction. That held locks that made
+    # external tools (SSMS) hang on plain SELECTs against the table, and
+    # any app restart silently rolled back all "saved" writes.
+    return pyodbc.connect(CONNECTION_STRING, autocommit=True)
 
 def get_connection():
     global _conn
@@ -188,7 +209,7 @@ def validate_query(query: str):
         if re.search(pat, query, re.IGNORECASE):
             raise ValueError(f"Query references backup/temp table (pattern: {pat}). Use only live tables.")
 
-def execute_query(query, limit=True):
+def execute_query(query, limit=True, params=None):
     global _conn
     for attempt in range(MAX_RETRIES):
         cursor = None
@@ -197,7 +218,10 @@ def execute_query(query, limit=True):
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             time.sleep(0.1)
-            cursor.execute(query)
+            if params is not None:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
 
             if not cursor.description:
                 return []
@@ -448,7 +472,11 @@ SECTION 6: STRICT RULES
     Agar question ke shuru mein "[STRICT ACCESS CONTROL: ...]" block diya ho, toh SQL query mein ALWAYS uss specific `mem_cd` ka filter lagana.
     Example: `WHERE RTRIM(mem_cd) = 'CCAPCC230009'`
     Kisi bhi dusre member ka data query mat karna. Agar user general question pooche (jaise "library me kitni books hain") jisme mem_cd filter zaroori nahi, toh usme mat lagana.
-
+18. NEVER return an empty string. You MUST ALWAYS output a valid T-SQL SELECT query. If you cannot generate a query, output `SELECT 1;`.
+19. MEMBER DETAILS QUERIES (CRITICAL):
+    - If user asks for "meri details", "my info", "details do", use the `VMember` view because it has the Department Name and Category Name.
+    - `m_member` table DOES NOT have `ctgry_desc` or `Branch_name`. If you need Department Name, use `VMember.Fclty_dept_dscr`.
+    - If you need member details, always use `VMember` instead of `m_member` to avoid missing column errors.
 ==============================
 SECTION 7: COMPLEX QUERY EXAMPLES
 ==============================
@@ -552,6 +580,18 @@ FROM (
 ) sub
 ORDER BY Transaction_Date, Transaction_Type;
 
+--- Example G: Get Logged-in User's Full Details ---
+SELECT
+    M.mem_cd AS Member_ID,
+    M.mem_firstnm + ' ' + M.mem_lstnm AS Member_Name,
+    M.mem_email AS Email,
+    M.mem_prmntphone AS Phone,
+    M.Fclty_dept_dscr AS Department,
+    M.ctgry_desc AS Category,
+    M.mem_status AS Status
+FROM VMember M
+WHERE RTRIM(M.mem_cd) = 'CCAPCC230001';
+
 ==============================
 SECTION 8: CHART GENERATION DATA FORMAT
 ==============================
@@ -577,13 +617,31 @@ current question is a follow-up that depends on context from earlier turns (pron
 "usme se", "iski", "unhe", "in members ka", "list them", "and their emails", "wapas", "usne", "ismein",
 "pichle wale", implicit topic continuation, etc.).
 
+CRITICAL DISTINCTION — SELF-REFERENCE vs TOPIC-CONTINUATION:
+There are TWO different kinds of pronoun in Hindi/Hinglish/English and they behave OPPOSITELY:
+- SELF-REFERENTIAL words — "meri", "mera", "mujhe", "main", "maine", "apna", "apni", "khud",
+  "my", "me", "I", "mine", "myself" — ALWAYS refer to the LOGGED-IN MEMBER ASKING THE QUESTION,
+  NEVER to whatever book/member/entity was being discussed in the previous turn. Even if the
+  previous turn was about a specific book, "meri photo do" means "give me (the logged-in
+  member)'s photo" — it does NOT mean the book's photo. Rewrite these by making the logged-in
+  member the explicit subject, e.g. "मुझे मेरी (logged-in member ki) photo dikhao" — do NOT
+  substitute in the previous turn's book/member name.
+- TOPIC-CONTINUATION words — "uska", "uski", "unka", "iski", "ismein", "usme se", "wapas",
+  "usne", "in members ka", "list them", "pichle wale" — these DO refer back to whatever
+  entity (book/member/date range/result set) was the subject of the previous turn(s). Resolve
+  these normally by substituting the specific entity from history.
+- If the CURRENT question corrects/clarifies a previous misunderstanding (e.g. previous turn's
+  answer was about a book but the user now says "nahi, meri" / "not the book's, mine" / "mera
+  matlab main"), treat it as SELF-REFERENTIAL about the logged-in member, not about the book.
+
 RULES:
 1. If there is NO conversation history, OR the current question is already fully standalone (it names its own
    subject/entity and does not rely on anything from earlier turns), output the question EXACTLY AS-IS, with no
    changes.
 2. If the current question DOES depend on earlier context, rewrite it into one fully standalone question by
    substituting in the specific entity/topic/filter from the conversation history (e.g. the department, the
-   member name, the book title, the date range, the previous result set being referred to).
+   member name, the book title, the date range, the previous result set being referred to) — UNLESS it is
+   self-referential per the distinction above, in which case keep it about the logged-in member.
 3. NEVER answer the question. NEVER add SQL. ONLY output the rewritten natural-language question.
 4. Preserve the original language style of the CURRENT question (Hindi / English / Hinglish) — do not translate it.
 5. Do not invent facts that aren't implied by the history. Keep the rewrite concise and faithful.
@@ -605,8 +663,8 @@ class ChatTurn(TypedDict):
     answer: str
 
 class AgentState(TypedDict):
-    question: str                       # raw question as typed by the user this turn
-    resolved_question: str              # standalone version used for SQL generation
+    question: str
+    resolved_question: str
     sql_query: str
     previous_sql: str
     query_result: str
@@ -614,11 +672,130 @@ class AgentState(TypedDict):
     attempts: int
     error: str
     error_history: List[str]
-    schema_hint: str                    # live ground-truth schema for tables in the failed query
+    schema_hint: str
     chart_base64: Optional[str]
-    chat_history: List[ChatTurn]        # persisted across turns via the checkpointer
+    chat_history: List[ChatTurn]
+    mem_cd: Optional[str]  
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0)
+
+# ==========================================
+# FACE RECOGNITION AI ENGINE INITIALIZATION
+# ==========================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[FACE] Using device: {device}")
+
+try:
+    face_detector = SCRFD(model_file="face_detection/scrfd/weights/scrfd_2.5g_bnkps.onnx")
+    face_recognizer = iresnet_inference("r100", path="face_recognition/arcface/weights/arcface_r100.pth", device=device)
+    face_recognizer.eval()
+    print("[FACE] AI Models loaded successfully")
+except Exception as e:
+    print(f"[FACE ERROR] Model init failed: {e}")
+    face_detector = None
+    face_recognizer = None
+
+# Image processing transformer
+face_preprocess = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((112, 112), antialias=True),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+class FaceEmbeddingCache:
+    _embeddings_matrix = None
+    _mem_cds = []
+    _last_refresh = 0
+    _lock = threading.Lock()
+
+    @classmethod
+    def refresh_embeddings(cls):
+        current_time = time.time()
+        if current_time - cls._last_refresh < 120: return # Refresh every 2 mins
+        
+        print("[FACE] Refreshing embedding cache from DB...")
+        try:
+            db_data = execute_query("SELECT mem_cd, embedding FROM m_memberFace WHERE is_active = 1", limit=False)
+            if not db_data: return
+            
+            mem_cds = []
+            embeddings_list = []
+            
+            for row in db_data:
+                try:
+                    vector_data = json.loads(row['embedding'])
+                    db_emb = np.array(vector_data["vector"], dtype=np.float32)
+                    norm = np.linalg.norm(db_emb)
+                    if norm > 0:
+                        db_emb = db_emb / norm
+                        mem_cds.append(row['mem_cd'].strip()) # Trailing spaces remove kiya
+                        embeddings_list.append(db_emb)
+                except: continue
+            
+            if embeddings_list:
+                with cls._lock:
+                    cls._embeddings_matrix = np.vstack(embeddings_list)
+                    cls._mem_cds = mem_cds
+                    cls._last_refresh = current_time
+                print(f"[FACE] Cache refreshed: {len(mem_cds)} faces loaded into RAM")
+        except Exception as e:
+            print(f"[FACE] Cache refresh error: {e}")
+
+
+@torch.no_grad()
+def extract_feature_fast(face_img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        im = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+        im = face_preprocess(im).unsqueeze(0).to(device)
+        emb = face_recognizer(im)[0].cpu().numpy()
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 0 else None
+    except Exception as e:
+        print(f"Feature extraction error: {e}")
+        return None
+
+def recognize_face_pipeline(image_base64: str) -> Dict[str, Any]:
+    if not face_detector or not face_recognizer:
+        return {"mem_cd": None, "error": "Models not loaded"}
+        
+    try:
+        # 1. Image Decode
+        img_data = base64.b64decode(image_base64)
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None: return {"mem_cd": None, "error": "Invalid image"}
+            
+        # 2. Face Detect
+        bboxes, _ = face_detector.detect(img)
+        if bboxes is None or len(bboxes) == 0:
+            return {"mem_cd": None, "error": "No face detected"}
+            
+        # 3. Crop Face
+        x1, y1, x2, y2, _ = bboxes[0]
+        face = img[max(0,int(y1)):int(y2), max(0,int(x1)):int(x2)]
+        
+        # 4. Extract Vector
+        target_emb = extract_feature_fast(face)
+        if target_emb is None: return {"mem_cd": None, "error": "Extraction failed"}
+            
+        # 5. Vectorized Matching (Fast Numpy Math)
+        with FaceEmbeddingCache._lock:
+            matrix = FaceEmbeddingCache._embeddings_matrix
+            mem_cds = FaceEmbeddingCache._mem_cds
+            
+        if matrix is None: return {"mem_cd": None, "error": "Cache not loaded"}
+            
+        similarities = np.dot(matrix, target_emb)
+        best_idx = np.argmax(similarities)
+        best_score = similarities[best_idx]
+        
+        if best_score >= 0.35: # 35% match threshold
+            return {"mem_cd": mem_cds[best_idx], "confidence": float(best_score), "error": None}
+        else:
+            return {"mem_cd": None, "confidence": float(best_score), "error": "Low confidence"}
+            
+    except Exception as e:
+        return {"mem_cd": None, "error": str(e)}
 
 
 def resolve_followup_node(state: AgentState):
@@ -659,13 +836,27 @@ def resolve_followup_node(state: AgentState):
 
 def generate_sql_node(state: AgentState):
     print("---GENERATING SQL---")
+    _t0 = time.time()
     prev_err = state.get("error", "")
     prev_sql = state.get("previous_sql", "")
     err_hist = state.get("error_history", [])
     schema_hint = state.get("schema_hint", "")
+    
+    # State se mem_cd nikaalo
+    user_mem_cd = state.get("mem_cd", "")
 
-    # Always generate SQL from the RESOLVED (standalone) question, not the raw one.
+    # Always generate SQL from the RESOLVED (standalone) question
     active_question = state.get("resolved_question") or state["question"]
+
+    # Agar mem_cd hai, toh strict instruction banao
+    access_control_block = ""
+    if user_mem_cd:
+        access_control_block = (
+            f"[STRICT ACCESS CONTROL: The logged-in user's mem_cd is '{user_mem_cd}'. "
+            f"You MUST filter all personal data (issues, returns, fines, member details) by this exact mem_cd. "
+            f"Always use WHERE RTRIM(mem_cd) = '{user_mem_cd}'. "
+            f"DO NOT show any other member's data under any circumstances.]\n\n"
+        )
 
     if prev_err:
         schema_block = (
@@ -675,6 +866,7 @@ def generate_sql_node(state: AgentState):
             if schema_hint else ""
         )
         user_msg = (
+            f"{access_control_block}"  # <-- YAHAN INJECT KIYA
             f"User Question: {active_question}\n\n"
             f"Your PREVIOUS SQL (which FAILED):\n{prev_sql}\n\n"
             f"ERROR returned by SQL Server:\n{prev_err}\n\n"
@@ -686,6 +878,7 @@ def generate_sql_node(state: AgentState):
         )
     else:
         user_msg = (
+            f"{access_control_block}"  # <-- YAHAN INJECT KIYA
             f"User Question: {active_question}\n\n"
             f"Generate the T-SQL query. Output ONLY the SQL without any markdown."
         )
@@ -695,6 +888,8 @@ def generate_sql_node(state: AgentState):
         HumanMessage(content=user_msg),
     ]
     response = llm.invoke(messages)
+    _elapsed = round((time.time() - _t0) * 1000)
+    print(f"---GENERATING SQL DONE in {_elapsed}ms---")
     return {
         "sql_query": response.content,
         "previous_sql": response.content,
@@ -703,14 +898,17 @@ def generate_sql_node(state: AgentState):
 
 def execute_sql_node(state: AgentState):
     print("---EXECUTING SQL---")
+    _t0 = time.time()
     clean_sql = state["sql_query"].replace("```sql", "").replace("```", "").strip()
     print(f"\n[DEBUG] SQL (attempt {state.get('attempts', 0)}):\n{clean_sql}\n")
 
     result = run_sql(clean_sql)
+    _elapsed = round((time.time() - _t0) * 1000)
     if result["success"]:
         data_str = str(result["data"])
         if len(data_str) > 12000:
             data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {result['rows']}]"
+        print(f"---EXECUTING SQL DONE in {_elapsed}ms (rows: {result['rows']})---")
         return {
             "query_result": data_str,
             "report_data": result["data"],
@@ -718,6 +916,7 @@ def execute_sql_node(state: AgentState):
             "schema_hint": "",
         }
     else:
+        print(f"---EXECUTING SQL FAILED in {_elapsed}ms---")
         print(f"[DEBUG] SQL ERROR: {result['error']}\n")
         hist = state.get("error_history", [])
         hist.append(result["error"])
@@ -787,26 +986,28 @@ def generate_chart_node(state: AgentState):
 
     return {"chart_base64": chart_b64}
 
-def generate_answer_node(state: AgentState):
-    print("---GENERATING FINAL ANSWER---")
+def build_generate_answer_messages(state: AgentState) -> List[Any]:
+    """Builds the prompt for the final answer-formatting LLM call.
 
+    Shared by the blocking ``generate_answer_node`` (used by /ask) and the
+    streaming path (used by /ask/v2) so both stay in sync.
+    """
     chart_note = ""
     if state.get("chart_base64"):
         chart_note = "A chart has been generated and attached for this data. Mention this in your response."
 
     row_count_note = ""
-    data_str = state.get("query_result", "[]")
-    try:
-        actual_data = ast.literal_eval(data_str)
-        if isinstance(actual_data, list):
-            row_count = len(actual_data)
+    # AST.PARSE ERROR FIX: query_result string ko parse karne ke bajaye
+    # direct state se report_data (original Python list) ki length check karo.
+    report_data_list = state.get("report_data") or []
+    if isinstance(report_data_list, list):
+        row_count = len(report_data_list)
+        if row_count > 0:
             row_count_note = f"\nIMPORTANT: The SQL query returned exactly {row_count} rows. If the user asks 'how many' or for a count, you MUST use this exact number ({row_count}) and do not guess or count manually."
-    except Exception as e:
-        print(f"Could not calculate row count for LLM: {e}")
 
     active_question = state.get("resolved_question") or state["question"]
 
-    messages = [
+    return [
         SystemMessage(content=f"""You are a helpful, professional library assistant. Based on the user's question and the SQL query result, give a clear, highly accurate, and perfectly formatted answer.
 
 LANGUAGE & FORMATTING RULES:
@@ -829,6 +1030,7 @@ LANGUAGE & FORMATTING RULES:
    - S.No. is only for display and must not come from the SQL result.
    - Do not change, remove, or invent any database values.
    - If the result has only a single value/count and is not a table, do NOT add S.No.
+11. SECURITY CONTEXT (CRITICAL): The user might ask for someone else's data (e.g., "Unnati ka data do"), but the SQL result will ONLY contain the logged-in user's data due to strict backend security. If the user asks for another person's name, but the database returns a different name (e.g., Somesh), you MUST explicitly tell the user: "Aap sirf apna data dekh sakte hain, kisi aur ka nahi." Then, present the logged-in user's data in the table using the exact name from the database. Do NOT use the name from the user's question in the table.
 {chart_note}"""),
         HumanMessage(content=f"User Question (as originally typed): {state['question']}\n\n"
                               f"Resolved standalone question used for SQL: {active_question}\n\n"
@@ -837,9 +1039,13 @@ LANGUAGE & FORMATTING RULES:
                               f"{row_count_note}\n\n"
                               f"Format this into a readable response.")
     ]
+
+
+def generate_answer_node(state: AgentState):
+    print("---GENERATING FINAL ANSWER---")
+    messages = build_generate_answer_messages(state)
     response = llm.invoke(messages)
     return {"query_result": response.content}
-
 
 def update_memory_node(state: AgentState):
     """
@@ -887,6 +1093,33 @@ workflow.add_edge("update_memory", END)
 library_agent = workflow.compile(
     checkpointer=checkpointer
 )
+
+# ---- Partial graph for /ask/v2 (streaming) ----
+# Same nodes/edges up to (and including) generate_chart, but stops there
+# instead of running generate_answer + update_memory. The streaming endpoint
+# runs generate_answer itself via llm.stream()/astream() so it can flush
+# tokens to the client as they arrive, then updates chat_history manually
+# (mirroring update_memory_node) once the full answer text is known.
+stream_workflow = StateGraph(AgentState)
+stream_workflow.add_node("resolve_followup", resolve_followup_node)
+stream_workflow.add_node("generate_sql", generate_sql_node)
+stream_workflow.add_node("execute_sql", execute_sql_node)
+stream_workflow.add_node("generate_chart", generate_chart_node)
+stream_workflow.set_entry_point("resolve_followup")
+stream_workflow.add_edge("resolve_followup", "generate_sql")
+stream_workflow.add_edge("generate_sql", "execute_sql")
+stream_workflow.add_conditional_edges(
+    "execute_sql",
+    check_status_node,
+    {
+        "retry_generate": "generate_sql",
+        END: END,
+        "generate_chart": "generate_chart",
+    },
+)
+stream_workflow.add_edge("generate_chart", END)
+
+library_agent_stream = stream_workflow.compile(checkpointer=checkpointer)
 
 # ==========================================
 # 5. FASTAPI APP SETUP
@@ -946,6 +1179,95 @@ def rfid_auth(request: RfidAuthRequest):
     )
 
 # ==========================================
+# FACE API ENDPOINTS
+# ==========================================
+class FaceRegisterRequest(BaseModel):
+    mem_cd: str
+    images: List[str]
+
+@app.post("/auth/face_register")
+def face_register_api(request: FaceRegisterRequest):
+    if not face_detector: raise HTTPException(500, "Models not loaded")
+    
+    img_base64 = request.images[0] 
+    img_data = base64.b64decode(img_base64)
+    nparr = np.frombuffer(img_data, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    bboxes, _ = face_detector.detect(img)
+    if bboxes is None or len(bboxes) == 0:
+        raise HTTPException(400, "No face detected in the image")
+        
+    x1, y1, x2, y2, _ = bboxes[0]
+    face = img[max(0,int(y1)):int(y2), max(0,int(x1)):int(x2)]
+    feat = extract_feature_fast(face)
+    
+    if feat is None: raise HTTPException(400, "Feature extraction failed")
+    
+    vector_json = json.dumps({"vector": feat.tolist()})
+    mem_cd_clean = request.mem_cd.strip()
+
+    # Re-encode the uploaded frame to a normalized JPEG data-URI so we have
+    # one consistent format to store/serve later, regardless of what the
+    # client originally uploaded (png/jpg/webp/etc).
+    ok, jpg_bytes = cv2.imencode(".jpg", img)
+    photo_data_uri = None
+    if ok:
+        photo_b64 = base64.b64encode(jpg_bytes.tobytes()).decode("ascii")
+        photo_data_uri = f"data:image/jpeg;base64,{photo_b64}"
+
+    try:
+        exists = execute_query(f"SELECT mem_cd FROM m_memberFace WHERE mem_cd = '{mem_cd_clean}'", limit=False)
+        if exists:
+            execute_query(
+                "UPDATE m_memberFace SET embedding = ?, photo_base64 = ?, is_active = 1 "
+                "WHERE mem_cd = ?",
+                params=(vector_json, photo_data_uri, mem_cd_clean),
+            )
+        else:
+            execute_query(
+                "INSERT INTO m_memberFace (mem_cd, embedding, photo_base64, is_active) "
+                "VALUES (?, ?, ?, 1)",
+                params=(mem_cd_clean, vector_json, photo_data_uri),
+            )
+        
+        # Naya data DB mein gaya, toh Cache ko force refresh karne ke liye timer reset kiya
+        FaceEmbeddingCache._last_refresh = 0 
+        FaceEmbeddingCache.refresh_embeddings()
+        
+        return {"status": "success", "mem_cd": mem_cd_clean, "message": "Face registered successfully!"}
+    except Exception as e:
+        raise HTTPException(500, f"DB Error: {e}")
+
+class FaceAuthRequest(BaseModel):
+    image: str
+
+class FaceAuthResponse(BaseModel):
+    success: bool
+    mem_cd: Optional[str] = None
+    member_name: Optional[str] = None
+    message: str
+
+@app.post("/auth/face", response_model=FaceAuthResponse)
+def face_auth(request: FaceAuthRequest):
+    if not face_detector:
+        return FaceAuthResponse(success=False, message="Models not loaded")
+        
+    result = recognize_face_pipeline(request.image)
+    
+    if result["mem_cd"]:
+        try:
+            mem_data = execute_query(f"SELECT mem_firstnm, mem_lstnm FROM m_member WHERE mem_cd = RTRIM('{result['mem_cd']}')", limit=False)
+            name = ""
+            if mem_data:
+                name = f"{mem_data[0].get('mem_firstnm', '')} {mem_data[0].get('mem_lstnm', '')}".strip()
+                
+            return FaceAuthResponse(success=True, mem_cd=result["mem_cd"], member_name=name, message=f"Login successful! (Score: {result['confidence']:.2f})")
+        except Exception as e:
+            return FaceAuthResponse(success=False, message=f"DB Error: {e}")
+    else:
+        return FaceAuthResponse(success=False, message=f"Match nahi hua: {result['error']}")
+# ==========================================
 # ASK ENDPOINT MODELS & LOGIC
 # ==========================================
 class QueryRequest(BaseModel):
@@ -963,6 +1285,7 @@ class QueryResponse(BaseModel):
     debug_error: Optional[str] = None
     report_available: bool = False
     report_id: Optional[str] = None
+    image_data: Optional[List[Dict[str, Any]]] = None  # [{label, member_name?, base64}]
 
 
 # ==========================================
@@ -1029,32 +1352,105 @@ def welcome_api():
 def read_root():
     return {"status": "SOUL30 Library Text-to-SQL API v3.1 (with follow-up memory) is running perfectly!"}
 
+# Matches self-referential photo/image requests ("meri photo do", "mujhe
+# apni pic chahiye", "show my picture", "mera image bhejo") in Hindi,
+# Hinglish, or English, in either word order. Deliberately does NOT match
+# book-photo questions ("uss kitab ki image do") since those have no
+# self-referential word.
+SELF_PHOTO_RE = re.compile(
+    r"(?:(?:meri|mera|mujhe|apni|apna|khud\s*ki|khud\s*ka|my|mine|myself)"
+    r".{0,20}(?:photo|image|pic\b|picture|tasveer|tasvir|chehra|face)"
+    r")"
+    r"|"
+    r"(?:(?:photo|image|pic\b|picture|tasveer|tasvir|chehra|face)"
+    r".{0,20}(?:meri|mera|mujhe|apni|apna|khud\s*ki|khud\s*ka|my|mine|myself)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def try_answer_self_photo(user_question: str, mem_cd: str) -> Optional["QueryResponse"]:
+    """If the question is asking for the logged-in member's own photo,
+    answer it directly from DB instead of running it through the SQL
+    agent (which has no concept of 'my photo' and would either hallucinate
+    or misroute it to book images). Returns None if this isn't a
+    self-photo question, so the caller falls through to normal handling.
+    """
+    if not SELF_PHOTO_RE.search(user_question):
+        return None
+
+    if not mem_cd:
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="आपकी फोटो दिखाने के लिए पहले लॉगिन करना ज़रूरी है (RFID या Face login).",
+            attempts=0,
+            report_available=False,
+            report_id=None,
+            image_data=None,
+        )
+
+    try:
+        rows = execute_query(
+            "SELECT photo_base64 FROM m_memberFace WHERE mem_cd = ? AND is_active = 1",
+            limit=False,
+            params=(mem_cd,),
+        )
+    except Exception as e:
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="माफ़ कीजिए, आपकी फोटो निकालने में समस्या आई.",
+            attempts=0,
+            debug_error=f"Photo lookup error: {e}",
+            report_available=False,
+            report_id=None,
+        )
+
+    photo = (rows[0].get("photo_base64") if rows else None)
+    if not photo:
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="आपकी फोटो अभी तक रजिस्टर नहीं है (सिर्फ़ face-embedding save है). Registration tool se dobara register karein.",
+            attempts=0,
+            report_available=False,
+            report_id=None,
+            image_data=None,
+        )
+
+    return QueryResponse(
+        question=user_question,
+        resolved_question=user_question,
+        sql_query="",
+        answer="यह रही आपकी रजिस्टर की गई फोटो.",
+        attempts=0,
+        report_available=False,
+        report_id=None,
+        image_data=[{"label": "आपकी फोटो", "base64": photo}],
+    )
+
+
 @app.post("/ask", response_model=QueryResponse)
 def ask_library_agent(request: QueryRequest):
     user_question = request.question
     mem_cd = (request.mem_cd or "").strip()
     
-    # ---- IDENTITY INJECTION ----
-    # Agar mem_cd aaya hai, toh LLM ko strict instruction do ki sirf iska data nikale
-    if mem_cd:
-        active_question = (
-            f"[STRICT ACCESS CONTROL: The logged-in user's mem_cd is '{mem_cd}'. "
-            f"You MUST filter all personal data (issues, returns, fines, member details) by this exact mem_cd. "
-            f"Always use WHERE RTRIM(mem_cd) = '{mem_cd}'. "
-            f"DO NOT show any other member's data under any circumstances.]\n\n"
-            f"User Question: {user_question}"
-        )
-    else:
-        # Agar koi mem_cd nahi bheja (general query)
-        active_question = user_question
-
     print(f"\n[API] mem_cd={mem_cd} Q={user_question}\n")
+
+    self_photo_response = try_answer_self_photo(user_question, mem_cd)
+    if self_photo_response is not None:
+        return self_photo_response
 
     try:
         final_state = library_agent.invoke(
             {
-                # Yahan hum active_question bhej rahe hain (jo context ke saath modified hai)
-                "question": active_question,   
+                # Yahan hum clean question aur mem_cd separately bhej rahe hain
+                "question": user_question,   
+                "mem_cd": mem_cd,            # <-- YEH NAYA HAI
                 "resolved_question": "",
                 "attempts": 0,
                 "error": "",
@@ -1137,6 +1533,196 @@ def ask_library_agent(request: QueryRequest):
         debug_error=db_error,
         report_available=report_available,
         report_id=report_id,
+    )
+
+def _sse(event_type: str, **payload) -> str:
+    """Formats one Server-Sent-Events line. Each event is a single JSON object."""
+    return f"data: {json.dumps({'type': event_type, **payload}, ensure_ascii=False, default=str)}\n\n"
+
+
+def _append_chat_history(thread_id: str, question: str, answer: str, base_state: Dict[str, Any]) -> None:
+    """Mirrors update_memory_node, but as a standalone call for the streaming path."""
+    history: List[ChatTurn] = base_state.get("chat_history", []) or []
+    history = history + [{"question": question, "answer": answer}]
+    if len(history) > MAX_HISTORY_TURNS:
+        history = history[-MAX_HISTORY_TURNS:]
+    library_agent.update_state(
+        config={"configurable": {"thread_id": thread_id}},
+        values={"chat_history": history},
+    )
+
+
+async def _ask_library_agent_v2_events(request: QueryRequest):
+    """Async generator yielding SSE events for /ask/v2.
+
+    Event types:
+      status  -> {stage}                          fired as each pipeline stage completes
+      token   -> {text}                            one chunk of the final answer, in order
+      done    -> full metadata, mirrors QueryResponse (answer omitted; use joined tokens)
+      error   -> {message}                          terminal; no further events follow
+    """
+    user_question = request.question
+    mem_cd = (request.mem_cd or "").strip()
+    print(f"\n[API v2] mem_cd={mem_cd} Q={user_question}\n")
+
+    # ---- self-photo shortcut: no SQL/LLM pipeline needed, answer immediately ----
+    self_photo_response = try_answer_self_photo(user_question, mem_cd)
+    if self_photo_response is not None:
+        yield _sse("token", text=self_photo_response.answer)
+        yield _sse(
+            "done",
+            question=user_question,
+            resolved_question=self_photo_response.resolved_question,
+            sql_query="",
+            chart_base64=None,
+            attempts=0,
+            debug_error=None,
+            report_available=False,
+            report_id=None,
+            image_data=self_photo_response.image_data,
+        )
+        return
+
+    # ---- run resolve_followup -> generate_sql -> execute_sql -> generate_chart ----
+    try:
+        final_state = await asyncio.to_thread(
+            library_agent_stream.invoke,
+            {
+                "question": user_question,
+                "mem_cd": mem_cd,
+                "resolved_question": "",
+                "attempts": 0,
+                "error": "",
+                "previous_sql": "",
+                "error_history": [],
+                "schema_hint": "",
+                "chart_base64": None,
+                "report_data": None,
+            },
+            config={"configurable": {"thread_id": request.thread_id}},
+        )
+    except groq.RateLimitError as e:
+        print(f"[API v2] GROQ RATE LIMIT EXCEEDED: {e}")
+        yield _sse(
+            "token",
+            text="सिस्टम अभी बहुत व्यस्त है, कृपया थोड़ी देर बाद फिर पूछें। "
+                 "The system is busy right now, please try again in a moment.",
+        )
+        yield _sse(
+            "done",
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            chart_base64=None,
+            attempts=1,
+            debug_error=f"Rate limit exceeded: {e}",
+            report_available=False,
+            report_id=None,
+        )
+        return
+    except Exception as e:
+        print(f"[API v2] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+        yield _sse("error", message=f"Library agent failed: {e}")
+        return
+
+    executed_sql = (final_state.get("sql_query", "")
+                    .replace("```sql", "").replace("```", "").strip())
+    db_error = final_state.get("error", None) or None
+    chart_b64 = final_state.get("chart_base64", None)
+    resolved_q = final_state.get("resolved_question", "") or user_question
+    attempts = final_state.get("attempts", 0)
+
+    yield _sse("status", stage="sql_ready", sql_query=executed_sql, attempts=attempts)
+
+    # ---- SAFETY NET (Defense in Depth) - identical to /ask ----
+    if mem_cd:
+        sql_lower = executed_sql.lower()
+        if mem_cd.lower() not in sql_lower:
+            sensitive_tables = ["m_member", "t_issue", "t_receive", "t_reserve", "t_memfine", "vmember", "vcmpltissuedetails"]
+            if any(table in sql_lower for table in sensitive_tables):
+                blocked_answer = "🔒 Aap sirf apna data dekh sakte hain. Yeh query access nahi ki ja sakti."
+                yield _sse("token", text=blocked_answer)
+                yield _sse(
+                    "done",
+                    question=user_question,
+                    resolved_question="",
+                    sql_query="",
+                    chart_base64=None,
+                    attempts=attempts,
+                    debug_error="Blocked: Missing mem_cd filter",
+                    report_available=False,
+                    report_id=None,
+                )
+                return
+
+    # ---- store report (if any rows) before streaming the answer ----
+    report_available = False
+    report_id = None
+    report_data = final_state.get("report_data", None)
+    if report_data and isinstance(report_data, list) and len(report_data) > 0:
+        try:
+            report_id = store_report(data=report_data, question=user_question, sql=executed_sql)
+            report_available = True
+        except Exception as e:
+            print(f"[REPORT_STORE] Failed to store report: {e}")
+
+    # ---- stream the final answer token-by-token ----
+    yield _sse("status", stage="answering")
+    messages = build_generate_answer_messages(final_state)
+    full_answer_parts: List[str] = []
+    try:
+        async for chunk in llm.astream(messages):
+            text = chunk.content or ""
+            if text:
+                full_answer_parts.append(text)
+                yield _sse("token", text=text)
+    except Exception as e:
+        print(f"[API v2] ANSWER STREAM ERROR: {type(e).__name__}: {e}")
+        yield _sse("error", message=f"Answer generation failed: {e}")
+        return
+
+    full_answer = "".join(full_answer_parts).strip()
+    if not full_answer:
+        full_answer = "माफ़ कीजिए, जवाब बनाने में समस्या आई। कृपया दोबारा पूछें."
+        yield _sse("token", text=full_answer)
+
+    # ---- persist chat_history (mirrors update_memory_node) ----
+    try:
+        _append_chat_history(request.thread_id, user_question, full_answer, final_state)
+    except Exception as e:
+        print(f"[API v2] chat_history update failed: {e}")
+
+    yield _sse(
+        "done",
+        question=user_question,
+        resolved_question=resolved_q,
+        sql_query=executed_sql,
+        chart_base64=chart_b64,
+        attempts=attempts,
+        debug_error=db_error,
+        report_available=report_available,
+        report_id=report_id,
+    )
+
+
+@app.post("/ask/v2")
+async def ask_library_agent_v2(request: QueryRequest):
+    """Streaming version of /ask.
+
+    Returns Server-Sent Events (``text/event-stream``); each line is
+    ``data: {"type": "...", ...}\\n\\n``. Event types: status, token, done, error.
+    Concatenate every ``token`` event's ``text`` field, in order, to get the
+    same ``answer`` field /ask returns; the final ``done`` event carries the
+    rest of the QueryResponse fields (sql_query, chart_base64, report_id, etc).
+    """
+    return StreamingResponse(
+        _ask_library_agent_v2_events(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering so chunks flush immediately
+        },
     )
 
 
@@ -1425,6 +2011,28 @@ def report_status(report_id: str):
         "remaining_seconds": int(remaining),
     }
 
+def ensure_photo_column():
+    """One-time migration: add photo_base64 to m_memberFace if it doesn't
+    exist yet (older DBs only stored the embedding, not the raw photo)."""
+    try:
+        check = execute_query(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'm_memberFace' AND COLUMN_NAME = 'photo_base64'",
+            limit=False,
+        )
+        if not check:
+            execute_query("ALTER TABLE m_memberFace ADD photo_base64 NVARCHAR(MAX) NULL", limit=False)
+            print("[MIGRATION] Added photo_base64 column to m_memberFace.")
+    except Exception as e:
+        print(f"[MIGRATION] Could not verify/add photo_base64 column: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Server start hote hi DB se Face Cache ko RAM mein la lo
+    ensure_photo_column()
+    FaceEmbeddingCache.refresh_embeddings()
+    print("[SYSTEM] Face Cache loaded into RAM.")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7698)
