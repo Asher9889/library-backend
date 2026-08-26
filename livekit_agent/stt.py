@@ -15,8 +15,11 @@ The server exposes the contract the voice agent expects:
 from __future__ import annotations
 
 import asyncio
+import logging
+import struct
 import time
 import uuid
+from pathlib import Path
 
 import aiohttp
 import numpy as np
@@ -31,6 +34,12 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGive
 from livekit.agents.utils import is_given
 
 from .config import settings
+
+_logger = logging.getLogger("soul.stt")
+
+_DUMP_DIR = Path(__file__).resolve().parent.parent / "voice-tmp"
+if settings.debug_dump_audio:
+    _DUMP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_NUM_CHANNELS = 1
@@ -52,6 +61,32 @@ def _to_mono_pcm16(buffer: utils.audio.AudioBuffer) -> tuple[bytes, int]:
     samples = samples.reshape(-1, num_channels)
     mono = samples.mean(axis=1).astype(np.int16)
     return mono.tobytes(), sample_rate
+
+
+def _dump_wav(pcm: bytes, sample_rate: int, request_id: str) -> None:
+    """Write raw mono s16le PCM to a WAV file under voice-tmp/."""
+    filename = _DUMP_DIR / f"{request_id}.wav"
+    num_samples = len(pcm) // 2  # s16le = 2 bytes per sample
+    data_size = num_samples * 2
+    with open(filename, "wb") as f:
+        # RIFF header
+        f.write(b"RIFF")
+        f.write(struct.pack("<I", 36 + data_size))
+        f.write(b"WAVE")
+        # fmt sub-chunk
+        f.write(b"fmt ")
+        f.write(struct.pack("<I", 16))          # sub-chunk size
+        f.write(struct.pack("<H", 1))           # PCM format
+        f.write(struct.pack("<H", 1))           # mono
+        f.write(struct.pack("<I", sample_rate))  # sample rate
+        f.write(struct.pack("<I", sample_rate * 2))  # byte rate (mono s16le)
+        f.write(struct.pack("<H", 2))           # block align
+        f.write(struct.pack("<H", 16))          # bits per sample
+        # data sub-chunk
+        f.write(b"data")
+        f.write(struct.pack("<I", data_size))
+        f.write(pcm)
+    _logger.info("dumped STT audio -> %s (%d Hz, %d bytes)", filename.name, sample_rate, len(pcm))
 
 
 class WhisperHTTPSTT(stt.STT):
@@ -96,7 +131,15 @@ class WhisperHTTPSTT(stt.STT):
     ) -> stt.SpeechEvent:
         pcm, frame_sample_rate = _to_mono_pcm16(buffer)
         request_id = uuid.uuid4().hex[:16]
+        sample_rate = self._sample_rate or frame_sample_rate
         started = time.perf_counter()
+
+        # ---- debug: dump raw audio to voice-tmp/ ----
+        if settings.debug_dump_audio:
+            try:
+                _dump_wav(pcm, sample_rate, request_id)
+            except Exception:
+                _logger.debug("failed to dump audio for %s", request_id, exc_info=True)
 
         params = {"request_id": request_id}
         if is_given(language):
@@ -104,7 +147,7 @@ class WhisperHTTPSTT(stt.STT):
 
         headers = {
             "Content-Type": "application/octet-stream",
-            "X-Sample-Rate": str(self._sample_rate or frame_sample_rate),
+            "X-Sample-Rate": str(sample_rate),
         }
 
         try:

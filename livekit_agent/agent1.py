@@ -26,18 +26,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
+from dataclasses import dataclass
 
 import httpx
 
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentServer, AgentSession, function_tool, room_io, TurnHandlingOptions, inference, RunContext
+from livekit.agents import Agent, AgentServer, AgentSession, function_tool, room_io
 from livekit.plugins import groq, silero
 
-# try:
-#     from livekit.plugins import dtln
-# except ImportError:
-#     dtln = None
+try:
+    from livekit.agents import RunContext
+except ImportError:  # pragma: no cover - fallback for older/newer SDK layouts
+    from livekit.agents.llm import RunContext
+
+try:
+    from livekit.plugins import dtln
+except ImportError:
+    dtln = None
 
 from .config import settings
 from .stt import WhisperHTTPSTT
@@ -50,10 +57,18 @@ _LOGS_ENABLED = settings.agent_logs
 if not _LOGS_ENABLED:
     logger.setLevel(logging.WARNING)
 
-# Thread id for the current voice session. Set from the dispatch metadata when a
-# session starts so follow-up questions share the same /ask conversation memory.
-_session_thread_id: str = ""
-_session_started_at: float = 0.0
+# Session state used to be kept in module-level globals here. That is unsafe
+# the moment a worker process ever hosts more than one concurrent voice
+# session (e.g. in-process/threaded job execution instead of the default
+# one-subprocess-per-job model): session A's mem_cd could bleed into session
+# B's query_library call mid-flight, which matters because mem_cd is what
+# restricts a user to their own library data. Per-session state now lives on
+# AgentSession.userdata instead (see SessionData below), which LiveKit scopes
+# to that one session/job and hands to tools via RunContext.userdata.
+@dataclass
+class SessionData:
+    thread_id: str = ""
+    mem_cd: str = ""
 
 
 def _log(msg: str, **extra) -> None:
@@ -68,27 +83,60 @@ def _log(msg: str, **extra) -> None:
         logger.info(msg)
 
 
+# Short, natural Hindi/Hinglish fillers spoken immediately when a library
+# lookup starts, so the user hears something within ~200-500ms instead of
+# 3-8s of dead silence while resolve_followup -> generate_sql -> execute_sql
+# -> generate_answer run on the backend. Kept deliberately short (TTS still
+# has to synthesize them) and free of any claim about what will be found.
+_QUERY_FILLERS = [
+    "एक सेकंड, चेक करता हूँ।",
+    "ठीक है, देखता हूँ लाइब्रेरी में।",
+    "रुकिए, पता करता हूँ।",
+    "हाँ, अभी देखता हूँ।",
+]
+
+
 @function_tool
-async def query_library(question: str,  thread_id: str = "") -> str:
+async def query_library(question: str, context: RunContext[SessionData]) -> str:
     """Query the SOUL 3.0 library database and return the answer.
 
     Handles any library-related question in Hindi, English or Hinglish: book
-    search, available titles, issued/returned books, members, overdue books,
+    search, available titles, issued/returned books, members, overdue books,                
     department-wise counts, reports, etc. The answer is a fully formatted,
     human-readable text you must then relay to the user in your own words,
     speaking style, converted from markdown (tables -> spoken sentences).
 
     Args:
         question: The user's library question exactly as they asked it.
-        thread_id: Optional conversation id so follow-up questions keep context.
     """
+    # Speak a filler immediately (fire-and-forget: session.say() starts
+    # playback in the background and does not block this coroutine). The
+    # actual answer, once ready, queues right behind it - same as a human
+    # assistant saying "one sec" before going to look something up.
+    try:
+        context.session.say(random.choice(_QUERY_FILLERS), allow_interruptions=True)
+    except Exception as e:
+        logger.warning("filler speech failed (non-fatal): %s", e)
+
     url = f"{settings.library_agent_url}/ask/v2"
-    thread = thread_id or _session_thread_id or "voice-session"
-    payload = {"question": question, "thread_id": thread, }
+
+    # Per-session state comes from context.userdata (see SessionData) - not
+    # module globals - so concurrent sessions in the same worker can never
+    # cross-talk.
+    thread = context.userdata.thread_id or "voice-session"
+    user_mem_cd = context.userdata.mem_cd
+
+    payload = {
+        "question": question, 
+        "thread_id": thread,
+        "mem_cd": user_mem_cd
+    }
+    
     _log(
         "tool query_library called",
         question=question,
         thread_id=thread,
+        mem_cd=user_mem_cd,
         endpoint=url,
     )
     started = time.time()
@@ -140,14 +188,10 @@ class LibraryAssistant(Agent):
                 "files, SQL or downloads. Convert numbers to a spoken form. "
                 "If the tool result is a table, summarize it in 1-3 sentences "
                 "mentioning the key counts. If the tool result is empty, say "
-                "no records were found."
-            ),
-            vad=inference.VAD(
-                model="silero",
-                min_speech_duration=0.9,      # 400ms continuous speech required (blocks coughs/taps/"hmm")
-                min_silence_duration=1.0,     # don't cut real speech on brief pauses
-                activation_threshold=0.7,     # only confident speech counts
-                prefix_padding_duration=0.5,  # keep onset so real speech isn't clipped
+                "no records were found. If the tool result is ALREADY a short "
+                "plain sentence (not a table), relay it directly in the same "
+                "words instead of rephrasing it - do not spend extra time "
+                "regenerating something that's already spoken-ready."
             ),
             tools=[query_library],
         )
@@ -158,8 +202,7 @@ server = AgentServer()
 
 @server.rtc_session(agent_name=settings.agent_name)
 async def library_assistant_session(ctx: agents.JobContext) -> None:
-    global _session_thread_id, _session_started_at
-    _session_started_at = time.time()
+    started_at = time.time()
     job = ctx.job
     _log(
         "AGENT SPAWNED",
@@ -177,7 +220,12 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
             meta = json.loads(job.metadata)
         except json.JSONDecodeError:
             logger.warning("unparseable job metadata: %s", job.metadata)
-    _session_thread_id = str(meta.get("thread_id") or "")
+
+    session_data = SessionData(
+        thread_id=str(meta.get("thread_id") or ""),
+        mem_cd=str(meta.get("user_id") or ""),  # user_id doubles as mem_cd
+    )
+
     _log(
         "AGENT JOB METADATA",
         event="job_metadata",
@@ -222,7 +270,7 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
             event="session_ended",
             job_id=job.id,
             room=ctx.room.name,
-            duration_s=round(time.time() - _session_started_at, 2),
+            duration_s=round(time.time() - started_at, 2),
         )
 
     _log(
@@ -241,29 +289,12 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         stt=WhisperHTTPSTT(),
         llm=groq.LLM(model=settings.groq_model),
         tts=KokoroHTTPTTS(),
-        # turn_handling={
-        #     "turn_detection": "vad",
-        #     "endpointing": {"min_delay": 0.6, "max_delay": 2.5},
-        #     "interruption": {"enabled": False},
-        # },
-        turn_handling=TurnHandlingOptions(
-                turn_detection=inference.TurnDetector(
-                    version="v1-mini",
-                    unlikely_threshold=0.7,
-                ),
-                endpointing={
-                    "mode": "dynamic",
-                    "min_delay": 0.7,
-                    "max_delay": 2.5,
-                },
-                interruption={
-                    "enabled": True,
-                    "mode": "adaptive",
-                },
-                preemptive_generation={
-                    "enabled": False,
-                },
-            ),
+        userdata=session_data,
+        turn_handling={
+            "turn_detection": "vad",
+            "endpointing": {"min_delay": 0.6, "max_delay": 2.5},
+            "interruption": {"enabled": False},
+        },
     )
 
     # ---- pipeline diagnostics (show which stage runs/fails per turn) ----
@@ -289,12 +320,10 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
     ))
 
     audio_input_options = room_io.AudioInputOptions(sample_rate=48000)
-    
-    # if dtln is not None:
-    #     # audio_input_options.noise_cancellation = dtln.noise_suppression()
-    #     pass
-    # else:
-    #     logger.warning("dtln not installed; running without noise cancellation")
+    if dtln is not None:
+        audio_input_options.noise_cancellation = dtln.noise_suppression()
+    else:
+        logger.warning("dtln not installed; running without noise cancellation")
 
     await session.start(
         room=ctx.room,
@@ -319,9 +348,7 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
     await session.generate_reply(
         instructions=(
             "Start by greeting the user warmly as the SOUL Library assistant in Hindi language, "
-            "and ask what they would like to know about the library. "
-            "Do NOT call any tools and do NOT fetch any library information in this greeting - "
-            "just greet and ask the question."
+            "and ask what they would like to know about the library."
         )
     )
 
@@ -330,5 +357,10 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         event="greeting_complete",
         job_id=job.id,
         room=ctx.room.name,
-        latency_s=round(time.time() - _session_started_at, 2),
+        latency_s=round(time.time() - started_at, 2),
     )
+
+
+if __name__ == "__main__":
+    from livekit.agents import cli
+    cli.run_app(server)
