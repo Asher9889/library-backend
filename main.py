@@ -43,9 +43,9 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.units import inch
 
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
-load_dotenv()
+# load_dotenv()
 
 
 
@@ -63,7 +63,7 @@ from livekit_agent.tokens import create_join_token, dispatch_agent, generate_roo
 # NOTE: Move these to real environment variables / a secrets manager before
 # deploying. Hardcoded DB + API credentials in source is a security risk,
 # especially since this file will end up in git history / logs.
-os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
+# os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
 
 
 def _resolve_odbc_driver() -> str:

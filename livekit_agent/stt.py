@@ -172,7 +172,7 @@ class WhisperHTTPSTT(stt.STT):
             raise APIStatusError(
                 message=e.message,
                 status_code=e.status,
-                body=e.response is not None,
+                body=e.message,
                 retryable=e.status in (429, 500, 503),
             ) from None
 

@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 
 import httpx
 
@@ -50,9 +51,13 @@ _LOGS_ENABLED = settings.agent_logs
 if not _LOGS_ENABLED:
     logger.setLevel(logging.WARNING)
 
-# Thread id for the current voice session. Set from the dispatch metadata when a
-# session starts so follow-up questions share the same /ask conversation memory.
-_session_thread_id: str = ""
+
+@dataclass
+class SessionData:
+    thread_id: str = ""
+    mem_cd: str = ""
+
+
 _session_started_at: float = 0.0
 
 
@@ -69,7 +74,7 @@ def _log(msg: str, **extra) -> None:
 
 
 @function_tool
-async def query_library(question: str,  thread_id: str = "") -> str:
+async def query_library(question: str, context: RunContext[SessionData]) -> str:
     """Query the SOUL 3.0 library database and return the answer.
 
     Handles any library-related question in Hindi, English or Hinglish: book
@@ -80,15 +85,16 @@ async def query_library(question: str,  thread_id: str = "") -> str:
 
     Args:
         question: The user's library question exactly as they asked it.
-        thread_id: Optional conversation id so follow-up questions keep context.
     """
-    url = f"{settings.library_agent_url}/ask/v2"
-    thread = thread_id or _session_thread_id or "voice-session"
-    payload = {"question": question, "thread_id": thread, }
+    url = f"{settings.library_agent_url}/ask"
+    thread = context.userdata.thread_id or "voice-session"
+    user_mem_cd = context.userdata.mem_cd
+    payload = {"question": question, "thread_id": thread, "mem_cd": user_mem_cd}
     _log(
         "tool query_library called",
         question=question,
         thread_id=thread,
+        mem_cd=user_mem_cd,
         endpoint=url,
     )
     started = time.time()
@@ -121,6 +127,7 @@ async def query_library(question: str,  thread_id: str = "") -> str:
     _log(
         "tool query_library succeeded",
         question=question,
+        answer=answer,
         answer_chars=len(answer),
         latency_ms=round((time.time() - started) * 1000),
     )
@@ -158,7 +165,7 @@ server = AgentServer()
 
 @server.rtc_session(agent_name=settings.agent_name)
 async def library_assistant_session(ctx: agents.JobContext) -> None:
-    global _session_thread_id, _session_started_at
+    global _session_started_at
     _session_started_at = time.time()
     job = ctx.job
     _log(
@@ -170,6 +177,14 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         agent_name=settings.agent_name,
     )
 
+    # ---- debug: verify which GROQ key is loaded ----
+    _k = settings.groq_api_key
+    if _k:
+        _masked = _k[:6] + "..." + _k[-4:] if len(_k) > 10 else "***"
+    else:
+        _masked = "<EMPTY>"
+    _log("GROQ API KEY CHECK", key_masked=_masked, model=settings.groq_model)
+
     # ---- job metadata (dispatch payload from the backend) ----
     meta: dict = {}
     if job.metadata:
@@ -177,7 +192,12 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
             meta = json.loads(job.metadata)
         except json.JSONDecodeError:
             logger.warning("unparseable job metadata: %s", job.metadata)
-    _session_thread_id = str(meta.get("thread_id") or "")
+
+    session_data = SessionData(
+        thread_id=str(meta.get("thread_id") or ""),
+        mem_cd=str(meta.get("user_id") or ""),
+    )
+
     _log(
         "AGENT JOB METADATA",
         event="job_metadata",
@@ -241,6 +261,7 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         stt=WhisperHTTPSTT(),
         llm=groq.LLM(model=settings.groq_model),
         tts=KokoroHTTPTTS(),
+        userdata=session_data,
         # turn_handling={
         #     "turn_detection": "vad",
         #     "endpointing": {"min_delay": 0.6, "max_delay": 2.5},
