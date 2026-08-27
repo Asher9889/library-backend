@@ -11,3 +11,8 @@ livekit-plugins-silero
 livekit-plugins-groq
 reportlab
 livekit-plugins-dtln
+
+opencv-python
+torch
+torchvision
+torchaudio

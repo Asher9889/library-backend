@@ -1,0 +1,2 @@
+face_detection/scrfd/weights/scrfd_2.5g_bnkps.onnx filter=lfs diff=lfs merge=lfs -text
+face_recognition/arcface/weights/arcface_r100.pth filter=lfs diff=lfs merge=lfs -text

@@ -43,7 +43,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.units import inch
 
-# === LONG-TERM CHAT MEMORY (SQLite, per-member, date-wise) ===
 import chat_memory
 
 checkpointer = MemorySaver()
@@ -60,7 +59,7 @@ from livekit_agent.tokens import create_join_token, dispatch_agent, generate_roo
 # NOTE: Move these to real environment variables / a secrets manager before
 # deploying. Hardcoded DB + API credentials in source is a security risk,
 # especially since this file will end up in git history / logs.
-os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
+os.environ["GROQ_API_KEY"] = lk_settings.groq_api_key
 
 
 def _resolve_odbc_driver() -> str:
@@ -833,6 +832,7 @@ def resolve_followup_node(state: AgentState):
 
 def generate_sql_node(state: AgentState):
     print("---GENERATING SQL---")
+    _t0 = time.time()
     prev_err = state.get("error", "")
     prev_sql = state.get("previous_sql", "")
     err_hist = state.get("error_history", [])
@@ -884,6 +884,8 @@ def generate_sql_node(state: AgentState):
         HumanMessage(content=user_msg),
     ]
     response = llm.invoke(messages)
+    _elapsed = round((time.time() - _t0) * 1000)
+    print(f"---GENERATING SQL DONE in {_elapsed}ms---")
     return {
         "sql_query": response.content,
         "previous_sql": response.content,
@@ -892,14 +894,17 @@ def generate_sql_node(state: AgentState):
 
 def execute_sql_node(state: AgentState):
     print("---EXECUTING SQL---")
+    _t0 = time.time()
     clean_sql = state["sql_query"].replace("```sql", "").replace("```", "").strip()
     print(f"\n[DEBUG] SQL (attempt {state.get('attempts', 0)}):\n{clean_sql}\n")
 
     result = run_sql(clean_sql)
+    _elapsed = round((time.time() - _t0) * 1000)
     if result["success"]:
         data_str = str(result["data"])
         if len(data_str) > 12000:
             data_str = data_str[:12000] + f"\n... [TRUNCATED, total rows: {result['rows']}]"
+        print(f"---EXECUTING SQL DONE in {_elapsed}ms (rows: {result['rows']})---")
         return {
             "query_result": data_str,
             "report_data": result["data"],
@@ -907,6 +912,7 @@ def execute_sql_node(state: AgentState):
             "schema_hint": "",
         }
     else:
+        print(f"---EXECUTING SQL FAILED in {_elapsed}ms---")
         print(f"[DEBUG] SQL ERROR: {result['error']}\n")
         hist = state.get("error_history", [])
         hist.append(result["error"])
@@ -1380,6 +1386,88 @@ def welcome_api():
 @app.get("/")
 def read_root():
     return {"status": "SOUL30 Library Text-to-SQL API v3.2 (with follow-up memory + long-term chat history) is running perfectly!"}
+
+# Matches self-referential photo/image requests ("meri photo do", "mujhe
+# apni pic chahiye", "show my picture", "mera image bhejo") in Hindi,
+# Hinglish, or English, in either word order. Deliberately does NOT match
+# book-photo questions ("uss kitab ki image do") since those have no
+# self-referential word.
+SELF_PHOTO_RE = re.compile(
+    r"(?:(?:meri|mera|mujhe|apni|apna|khud\s*ki|khud\s*ka|my|mine|myself)"
+    r".{0,20}(?:photo|image|pic\b|picture|tasveer|tasvir|chehra|face)"
+    r")"
+    r"|"
+    r"(?:(?:photo|image|pic\b|picture|tasveer|tasvir|chehra|face)"
+    r".{0,20}(?:meri|mera|mujhe|apni|apna|khud\s*ki|khud\s*ka|my|mine|myself)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def try_answer_self_photo(user_question: str, mem_cd: str) -> Optional["QueryResponse"]:
+    """If the question is asking for the logged-in member's own photo,
+    answer it directly from DB instead of running it through the SQL
+    agent (which has no concept of 'my photo' and would either hallucinate
+    or misroute it to book images). Returns None if this isn't a
+    self-photo question, so the caller falls through to normal handling.
+    """
+    if not SELF_PHOTO_RE.search(user_question):
+        return None
+
+    if not mem_cd:
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="आपकी फोटो दिखाने के लिए पहले लॉगिन करना ज़रूरी है (RFID या Face login).",
+            attempts=0,
+            report_available=False,
+            report_id=None,
+            image_data=None,
+        )
+
+    try:
+        rows = execute_query(
+            "SELECT photo_base64 FROM m_memberFace WHERE mem_cd = ? AND is_active = 1",
+            limit=False,
+            params=(mem_cd,),
+        )
+    except Exception as e:
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="माफ़ कीजिए, आपकी फोटो निकालने में समस्या आई.",
+            attempts=0,
+            debug_error=f"Photo lookup error: {e}",
+            report_available=False,
+            report_id=None,
+        )
+
+    photo = (rows[0].get("photo_base64") if rows else None)
+    if not photo:
+        return QueryResponse(
+            question=user_question,
+            resolved_question=user_question,
+            sql_query="",
+            answer="आपकी फोटो अभी तक रजिस्टर नहीं है (सिर्फ़ face-embedding save है). Registration tool se dobara register karein.",
+            attempts=0,
+            report_available=False,
+            report_id=None,
+            image_data=None,
+        )
+
+    return QueryResponse(
+        question=user_question,
+        resolved_question=user_question,
+        sql_query="",
+        answer="यह रही आपकी रजिस्टर की गई फोटो.",
+        attempts=0,
+        report_available=False,
+        report_id=None,
+        image_data=[{"label": "आपकी फोटो", "base64": photo}],
+    )
+
 
 # Matches self-referential photo/image requests ("meri photo do", "mujhe
 # apni pic chahiye", "show my picture", "mera image bhejo") in Hindi,
