@@ -16,3 +16,6 @@ opencv-python
 torch
 torchvision
 torchaudio
+
+
+langchain_openai

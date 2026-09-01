@@ -73,6 +73,7 @@ class KokoroHTTPTTS(tts.TTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> tts.ChunkedStream:
+        print(f"\n{'='*60}\n🔊 TTS INPUT TEXT:\n{text}\n{'='*60}\n")
         return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
 
