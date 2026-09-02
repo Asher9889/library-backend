@@ -1,4 +1,4 @@
-"""Tests for the voice agent's library query tool (livekit_agent.agent)."""
+"""Tests for the voice agent's backend pass-through (livekit_agent.agent)."""
 from __future__ import annotations
 
 import pytest
@@ -41,6 +41,17 @@ class MockLibraryAPI:
             await self._runner.cleanup()
 
 
+class FakeSession:
+    """Minimal stand-in for AgentSession — records what was spoken via say()."""
+
+    def __init__(self) -> None:
+        self.spoken: list[str] = []
+
+    async def say(self, text: str) -> object:
+        self.spoken.append(text)
+        return None
+
+
 @pytest.fixture()
 async def mock_library(monkeypatch):
     server = MockLibraryAPI()
@@ -50,52 +61,69 @@ async def mock_library(monkeypatch):
     await server.stop()
 
 
+def _session_data(thread_id: str = "voice-1", mem_cd: str = "") -> agent_mod.SessionData:
+    return agent_mod.SessionData(thread_id=thread_id, mem_cd=mem_cd)
+
+async def _call(transcript: str, *, session_data=None, turn: int = 1):
+    session = FakeSession()
+    sd = session_data or _session_data()
+    agent_mod._current_turn = turn
+    await agent_mod._call_backend(transcript, sd, turn, session)
+    return session
+
+
 @pytest.mark.asyncio
-async def test_query_library_returns_answer(mock_library: MockLibraryAPI):
-    answer = await agent_mod.query_library("kitni books hain?", thread_id="voice-1")
-    assert answer == "There are 42 books in the library."
+async def test_call_backend_posts_and_speaks(mock_library: MockLibraryAPI):
+    session = await _call("kitni books hain?")
+    assert session.spoken == ["There are 42 books in the library."]
     assert mock_library.request_bodies[0]["question"] == "kitni books hain?"
     assert mock_library.request_bodies[0]["thread_id"] == "voice-1"
 
 
 @pytest.mark.asyncio
-async def test_query_library_uses_session_thread_id(mock_library: MockLibraryAPI, monkeypatch):
-    monkeypatch.setattr(agent_mod, "_session_thread_id", "sess-42")
-    await agent_mod.query_library("kitni books hain?")
+async def test_call_backend_uses_session_thread_id(mock_library: MockLibraryAPI):
+    await _call("kitni books hain?", session_data=_session_data(thread_id="sess-42"))
     assert mock_library.request_bodies[0]["thread_id"] == "sess-42"
 
 
 @pytest.mark.asyncio
-async def test_query_library_posts_to_ask_endpoint(mock_library: MockLibraryAPI, monkeypatch):
-    monkeypatch.setattr(agent_mod, "_session_thread_id", "")
-    await agent_mod.query_library("hello")
+async def test_call_backend_default_thread_id(mock_library: MockLibraryAPI):
+    await _call("hello", session_data=_session_data(thread_id=""))
     assert mock_library.request_bodies[0]["thread_id"] == "voice-session"
 
 
 @pytest.mark.asyncio
-async def test_query_library_handles_empty_answer(mock_library: MockLibraryAPI):
-    mock_library.response["answer"] = ""
-    answer = await agent_mod.query_library("kuch bhi")
-    assert "couldn" in answer
+async def test_call_backend_sends_mem_cd(mock_library: MockLibraryAPI):
+    await _call("hello", session_data=_session_data(thread_id="t", mem_cd="M-1"))
+    assert mock_library.request_bodies[0]["mem_cd"] == "M-1"
 
 
 @pytest.mark.asyncio
-async def test_query_library_handles_debug_error(mock_library: MockLibraryAPI):
+async def test_call_backend_handles_empty_answer(mock_library: MockLibraryAPI):
+    mock_library.response["answer"] = ""
+    session = await _call("kuch bhi")
+    assert "couldn" in session.spoken[0]
+
+
+@pytest.mark.asyncio
+async def test_call_backend_handles_debug_error(mock_library: MockLibraryAPI):
     mock_library.response["answer"] = "something"
     mock_library.response["debug_error"] = "bad column"
-    answer = await agent_mod.query_library("kuch bhi")
-    assert "couldn" in answer
+    session = await _call("kuch bhi")
+    assert "couldn" in session.spoken[0]
 
 
 @pytest.mark.asyncio
-async def test_query_library_handles_unreachable_backend(monkeypatch):
+async def test_call_backend_handles_unreachable_backend(monkeypatch):
     monkeypatch.setattr(agent_mod.settings, "library_agent_url", "http://127.0.0.1:1")
-    answer = await agent_mod.query_library("kuch bhi")
-    assert "could not reach" in answer
+    session = await _call("kuch bhi")
+    assert "could not reach" in session.spoken[0]
 
 
 @pytest.mark.asyncio
-async def test_assistant_exposes_library_tool():
-    assistant = agent_mod.LibraryAssistant()
-    tool_names = [t.info.name for t in (assistant.tools or [])]
-    assert "query_library" in tool_names
+async def test_stale_turn_does_not_speak(mock_library: MockLibraryAPI):
+    session = FakeSession()
+    sd = _session_data()
+    agent_mod._current_turn = 5
+    await agent_mod._call_backend("stale?", sd, 3, session)
+    assert session.spoken == []

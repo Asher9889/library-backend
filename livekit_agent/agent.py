@@ -5,11 +5,15 @@ Runs as a worker process that registers with the LiveKit server under
 token's room configuration or the explicit dispatch endpoint), this worker
 spawns a voice session in the client's room.
 
-Pipeline:
+Pipeline (pure pass-through — no LLM in the agent):
   VAD  -> silero (local, free)
   STT  -> self-hosted faster-whisper server  (livekit_agent.stt.WhisperHTTPSTT)
-  LLM  -> Ollama qwen2.5:7b via OpenAI-compatible plugin (tool-calls the library text-to-SQL backend)
   TTS  -> self-hosted Kokoro server          (livekit_agent.tts.KokoroHTTPTTS)
+
+Every final user transcript is sent directly to the Python backend
+``/ask`` endpoint (which has its own LLM + memory). The backend's answer
+is spoken back to the user via TTS. The agent never generates responses
+itself.
 
 Lifecycle logging:
   Every phase of the agent lifecycle is logged to the ``soul.livekit`` logger
@@ -32,13 +36,8 @@ from dataclasses import dataclass
 import httpx
 
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentServer, AgentSession, function_tool, room_io, TurnHandlingOptions, inference, RunContext
-from livekit.plugins import openai, silero
-
-# try:
-#     from livekit.plugins import dtln
-# except ImportError:
-#     dtln = None
+from livekit.agents import Agent, AgentServer, AgentSession, room_io, inference
+from livekit.plugins import silero
 
 from .config import settings
 from .stt import WhisperHTTPSTT
@@ -61,6 +60,9 @@ class SessionData:
 
 _session_started_at: float = 0.0
 
+_last_user_transcript: str = ""
+_current_turn: int = 0
+
 
 def _log(msg: str, **extra) -> None:
     """Emit a lifecycle log line. Suppressed entirely when logs are disabled."""
@@ -74,100 +76,157 @@ def _log(msg: str, **extra) -> None:
         logger.info(msg)
 
 
-@function_tool
-async def query_library(question: str, context: RunContext[SessionData]) -> str:
-    """Query the SOUL 3.0 library database and return the answer.
+class VoicePassThrough(Agent):
+    """Minimal agent — VAD only, no LLM, no tools."""
 
-    Handles any library-related question in Hindi, English or Hinglish: book
-    search, available titles, issued/returned books, members, overdue books,
-    department-wise counts, reports, etc. The answer is a fully formatted,
-    human-readable text you must then relay to the user in your own words,
-    speaking style, converted from markdown (tables -> spoken sentences).
-
-    Args:
-        question: The user's library question exactly as they asked it.
-    """
-    url = f"{settings.library_agent_url}/ask"
-    thread = context.userdata.thread_id or "voice-session"
-    user_mem_cd = context.userdata.mem_cd
-    payload = {"question": question, "thread_id": thread, "mem_cd": user_mem_cd}
-    _log(
-        "tool query_library called",
-        question=question,
-        thread_id=thread,
-        mem_cd=user_mem_cd,
-        endpoint=url,
-    )
-    started = time.time()
-    try:
-        async with httpx.AsyncClient(timeout=settings.library_agent_timeout) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as e:
-        logger.warning(
-            "tool query_library FAILED",
-            extra={"question": question, "error": str(e)},
-        )
-        return (
-            "I could not reach the library system right now. "
-            "Please try again in a moment."
-        )
-
-    answer = data.get("answer") or ""
-    if not answer or data.get("debug_error"):
-        _log(
-            "tool query_library returned empty/error",
-            question=question,
-            debug_error=data.get("debug_error"),
-        )
-        return (
-            "I couldn't fetch that information from the library database. "
-            "Please rephrase the question and try again."
-        )
-    _log(
-        "tool query_library succeeded",
-        question=question,
-        answer=answer,
-        answer_chars=len(answer),
-        latency_ms=round((time.time() - started) * 1000),
-    )
-    return answer
-
-
-class LibraryAssistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions=(
-                "You are the SOUL Library voice assistant. You speak in "
-                "the same language the user uses (Hindi, English or Hinglish). "
-                "Use the query_library tool for ANY question about books, "
-                "members, issues, returns, dues, fines or library reports. "
-                "Rules: keep replies short and conversational - never read "
-                "tables, never say serial numbers, never mention markdown, "
-                "files, SQL or downloads. Convert numbers to a spoken form. "
-                "If the tool result is a table, summarize it in 1-3 sentences "
-                "mentioning the key counts. If the tool result is empty, say "
-                "no records were found."
-            ),
+            instructions="Pass-through voice link to the library agent backend.",
             vad=inference.VAD(
                 model="silero",
-                min_speech_duration=0.9,      # 400ms continuous speech required (blocks coughs/taps/"hmm")
-                min_silence_duration=1.0,     # don't cut real speech on brief pauses
-                activation_threshold=0.7,     # only confident speech counts
-                prefix_padding_duration=0.5,  # keep onset so real speech isn't clipped
+                min_speech_duration=0.9,
+                min_silence_duration=1.0,
+                activation_threshold=0.7,
+                prefix_padding_duration=0.5,
             ),
-            tools=[query_library],
         )
 
 
 server = AgentServer()
 
 
+async def _call_backend(
+    transcript: str,
+    session_data: SessionData,
+    turn_number: int,
+    session: AgentSession,
+) -> None:
+    """POST the user's transcript to /ask and speak the backend's answer."""
+    global _current_turn
+
+    url = f"{settings.library_agent_url}/ask"
+    thread = session_data.thread_id or "voice-session"
+    user_mem_cd = session_data.mem_cd
+    payload = {"question": transcript, "thread_id": thread, "mem_cd": user_mem_cd}
+
+    _log(
+        "BACKEND REQUEST DISPATCHED",
+        event="backend_dispatched",
+        turn=turn_number,
+        transcript=transcript,
+        endpoint=url,
+        thread_id=thread,
+        mem_cd=user_mem_cd,
+    )
+
+    started = time.time()
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.library_agent_timeout) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        # ---- check if a newer turn started while we were waiting ----
+        if turn_number != _current_turn:
+            _log(
+                "BACKEND CALL DISCARDED (STALE TURN)",
+                event="stale_turn_discarded",
+                turn=turn_number,
+                current_turn=_current_turn,
+                transcript=transcript,
+                latency_ms=round((time.time() - started) * 1000),
+            )
+            return
+
+        answer = data.get("answer") or ""
+        debug_error = data.get("debug_error")
+
+        _log(
+            "BACKEND RESPONSE RECEIVED",
+            event="backend_response_received",
+            turn=turn_number,
+            http_status=resp.status_code,
+            answer=answer,
+            answer_chars=len(answer),
+            debug_error=debug_error,
+            latency_ms=round((time.time() - started) * 1000),
+        )
+
+        if not answer or debug_error:
+            answer = (
+                "I couldn't get that information from the library system. "
+                "Please try again."
+            )
+
+    except Exception as e:
+        if turn_number != _current_turn:
+            _log(
+                "BACKEND CALL DISCARDED (STALE TURN)",
+                event="stale_turn_discarded",
+                turn=turn_number,
+                current_turn=_current_turn,
+                transcript=transcript,
+                error=str(e),
+                latency_ms=round((time.time() - started) * 1000),
+            )
+            return
+
+        _log(
+            "BACKEND CALL FAILED",
+            event="backend_call_failed",
+            turn=turn_number,
+            error=str(e),
+            latency_ms=round((time.time() - started) * 1000),
+        )
+        answer = (
+            "I could not reach the library system right now. "
+            "Please try again in a moment."
+        )
+
+    _log(
+        "AGENT SPEAKING (TTS)",
+        event="agent_speaking",
+        turn=turn_number,
+        answer=answer,
+    )
+    await session.say(answer)
+
+
+def _on_user_input_transcribed(ev, session: AgentSession, session_data: SessionData) -> None:
+    global _last_user_transcript, _current_turn
+
+    transcript = ev.transcript or ""
+
+    _log(
+        "STEP1 USER SPOKE (STT OUTPUT)",
+        event="user_input_transcribed",
+        is_final=ev.is_final,
+        transcript=transcript,
+    )
+
+    if not ev.is_final or not transcript.strip():
+        return
+
+    _last_user_transcript = transcript.strip()
+    _current_turn += 1
+    turn = _current_turn
+
+    _log(
+        "STEP2 TRANSCRIPT READY (DISPATCHING TO BACKEND)",
+        event="transcript_dispatching",
+        turn=turn,
+        transcript=_last_user_transcript,
+    )
+
+    asyncio.ensure_future(_call_backend(_last_user_transcript, session_data, turn, session))
+
+
 @server.rtc_session(agent_name=settings.agent_name)
 async def library_assistant_session(ctx: agents.JobContext) -> None:
-    global _session_started_at
+    global _session_started_at, _current_turn
     _session_started_at = time.time()
+    _current_turn = 0
     job = ctx.job
     _log(
         "AGENT SPAWNED",
@@ -176,19 +235,6 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         dispatch_id=getattr(job, "dispatch_id", "") or "",
         room=ctx.room.name,
         agent_name=settings.agent_name,
-    )
-
-    # ---- debug: verify which voice LLM config is loaded ----
-    _k = settings.voice_llm_api_key
-    if _k:
-        _masked = _k[:6] + "..." + _k[-4:] if len(_k) > 10 else "***"
-    else:
-        _masked = "<EMPTY>"
-    _log(
-        "VOICE LLM CONFIG",
-        key_masked=_masked,
-        model=settings.voice_llm_model,
-        base_url=settings.voice_llm_base_url,
     )
 
     # ---- job metadata (dispatch payload from the backend) ----
@@ -268,43 +314,32 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         room=ctx.room.name,
         vad="silero",
         stt=f"whisper-http({settings.stt_url})",
-        llm=f"openai({settings.voice_llm_model})",
+        llm="NONE (pure pass-through to /ask)",
         tts=f"kokoro-http({settings.tts_url})",
+        backend_url=f"{settings.library_agent_url}/ask",
     )
 
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=WhisperHTTPSTT(),
-        llm=openai.LLM(
-            model=settings.voice_llm_model,
-            base_url=settings.voice_llm_base_url,
-            api_key=settings.voice_llm_api_key,
-        ),
+        llm=None,
         tts=KokoroHTTPTTS(),
         userdata=session_data,
-        # turn_handling={
-        #     "turn_detection": "vad",
-        #     "endpointing": {"min_delay": 0.6, "max_delay": 2.5},
-        #     "interruption": {"enabled": False},
-        # },
-        turn_handling=TurnHandlingOptions(
-                turn_detection=inference.TurnDetector(
-                    version="v1-mini",
-                    unlikely_threshold=0.7,
-                ),
-                endpointing={
-                    "mode": "dynamic",
-                    "min_delay": 0.7,
-                    "max_delay": 2.5,
-                },
-                interruption={
-                    "enabled": True,
-                    "mode": "adaptive",
-                },
-                preemptive_generation={
-                    "enabled": False,
-                },
-            ),
+        turn_handling={
+            "turn_detection": "vad",
+            "endpointing": {
+                "mode": "dynamic",
+                "min_delay": 0.7,
+                "max_delay": 2.5,
+            },
+            "interruption": {
+                "enabled": True,
+                "mode": "adaptive",
+            },
+            "preemptive_generation": {
+                "enabled": False,
+            },
+        },
     )
 
     # ---- pipeline diagnostics (show which stage runs/fails per turn) ----
@@ -316,33 +351,24 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         "USER STATE", event="user_state_changed",
         old=ev.old_state, new=ev.new_state,
     ))
-    session.on("user_input_transcribed", lambda ev: _log(
-        "USER TRANSCRIBED", event="user_input_transcribed",
-        transcript=ev.transcript, is_final=ev.is_final,
-    ))
-    session.on("function_tools_executed", lambda ev: _log(
-        "TOOLS EXECUTED", event="function_tools_executed",
-        calls=[c.name for c in ev.function_calls],
-    ))
+
+    session.on(
+        "user_input_transcribed",
+        lambda ev: _on_user_input_transcribed(ev, session, session_data),
+    )
     session.on("error", lambda ev: logger.error(
         "SESSION ERROR %s: %s (source=%s)",
         type(ev.error).__name__, ev.error, ev.source,
     ))
 
     audio_input_options = room_io.AudioInputOptions(sample_rate=48000)
-    
-    # if dtln is not None:
-    #     # audio_input_options.noise_cancellation = dtln.noise_suppression()
-    #     pass
-    # else:
-    #     logger.warning("dtln not installed; running without noise cancellation")
 
     await session.start(
         room=ctx.room,
-        agent=LibraryAssistant(),
+        agent=VoicePassThrough(),
         room_options=room_io.RoomOptions(audio_input=audio_input_options),
     )
-    
+
     _log(
         "AGENT SESSION STARTED (LISTENING)",
         event="session_started",
@@ -356,7 +382,7 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         job_id=job.id,
         room=ctx.room.name,
     )
-    
+
     if session_data.user_name:
         greeting = (
             f"नमस्ते {session_data.user_name}! मैं सोल लाइब्रेरी असिस्टेंट हूँ। "

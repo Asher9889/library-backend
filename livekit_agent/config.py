@@ -40,9 +40,6 @@ class Settings:
     agent_deployment: str
     agent_display_name: str
     agent_logs: bool
-    voice_llm_base_url: str
-    voice_llm_api_key: str
-    voice_llm_model: str
     stt_url: str
     tts_url: str
     tts_language: str
@@ -64,9 +61,6 @@ settings = Settings(
     agent_deployment=_get("LIVEKIT_AGENT_DEPLOYMENT", ""),
     agent_display_name=_get("LIVEKIT_AGENT_DISPLAY_NAME", "SOUL Library Assistant"),
     agent_logs=_get_bool("LIVEKIT_AGENT_LOGS", True),
-    voice_llm_base_url=_get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
-    voice_llm_api_key=_get("OLLAMA_API_KEY", "ollama"),
-    voice_llm_model=_get("OLLAMA_MODEL", "qwen2.5:7b"),
     stt_url=_get("STT_SERVER_URL", "http://localhost:8000").rstrip("/"),
     tts_url=_get("TTS_SERVER_URL", "http://localhost:8001").rstrip("/"),
     tts_language=_get("TTS_LANGUAGE", "hi"),

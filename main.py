@@ -1310,17 +1310,17 @@ def generate_answer_node(state: AgentState):
     
     ans_prompt = f"""User question: {question}
 
-SQL Result Data:
-{data_str}
+    SQL Result Data:
+    {data_str}
 
-Based on the above data, answer the user's question in a short, natural, conversational sentence in Hindi/Hinglish.
-CRITICAL RULES FOR VOICE OUTPUT (TTS):
-1. Output ONLY plain text that can be spoken by a Text-to-Speech engine.
-2. NEVER use markdown tables, asterisks (*), hash (#), or pipe (|) characters.
-3. If there are multiple rows, summarize them naturally (e.g., "The books are A, B, and C.").
-4. If it is a single name or detail, just speak it directly (e.g., "आपका नाम अनुभव वर्मा है।").
-5. Do not say "Here is the data" or "Based on the result". Just answer the question directly.
-"""
+    Based on the above data, answer the user's question in a short, natural, conversational sentence in Hindi/Hinglish.
+    CRITICAL RULES FOR VOICE OUTPUT (TTS):
+    1. Output ONLY plain text that can be spoken by a Text-to-Speech engine.
+    2. NEVER use markdown tables, asterisks (*), hash (#), or pipe (|) characters.
+    3. If there are multiple rows, summarize them naturally (e.g., "The books are A, B, and C.").
+    4. If it is a single name or detail, just speak it directly (e.g., "आपका नाम अनुभव वर्मा है।").
+    5. Do not say "Here is the data" or "Based on the result". Just answer the question directly.
+    """
     try:
         response = llm_answer.invoke([HumanMessage(content=ans_prompt)], config={"metadata": {"node_name": "generate_answer"}})
         answer = response.content.strip()

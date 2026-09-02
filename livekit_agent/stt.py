@@ -181,6 +181,15 @@ class WhisperHTTPSTT(stt.STT):
         detected_language = str(data.get("language") or "en")
         confidence = float(data.get("confidence") or 0.0)
 
+        _logger.info(
+            "STT RESULT %s latency_ms=%d language=%s confidence=%.3f transcript=%r",
+            request_id,
+            round((time.perf_counter() - started) * 1000),
+            detected_language,
+            confidence,
+            transcript,
+        )
+
         if not transcript:
             return stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,

@@ -11,6 +11,8 @@ Response headers: X-Sample-Rate, X-Channels, X-Sample-Format.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 
 import aiohttp
@@ -28,6 +30,8 @@ from .config import settings
 
 DEFAULT_SAMPLE_RATE = 44100
 NUM_CHANNELS = 1
+
+_logger = logging.getLogger("soul.tts")
 
 
 class KokoroHTTPTTS(tts.TTS):
@@ -73,7 +77,7 @@ class KokoroHTTPTTS(tts.TTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> tts.ChunkedStream:
-        print(f"\n{'='*60}\n🔊 TTS INPUT TEXT:\n{text}\n{'='*60}\n")
+        _logger.info("TTS REQUEST START text=%r voice=%s language=%s", text, self._voice, self._language)
         return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
 
@@ -91,6 +95,7 @@ class ChunkedStream(tts.ChunkedStream):
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = uuid.uuid4().hex[:16]
         sample_rate = self._tts._sample_rate
+        started = time.perf_counter()
 
         body = {
             "text": self._input_text,
@@ -100,6 +105,13 @@ class ChunkedStream(tts.ChunkedStream):
             "sample_rate": sample_rate,
             "request_id": request_id,
         }
+
+        _logger.info(
+            "TTS CALL %s latency_start url=%s text=%r",
+            request_id,
+            self._tts._url,
+            self._input_text,
+        )
 
         try:
             async with self._tts._ensure_session().post(
@@ -132,6 +144,13 @@ class ChunkedStream(tts.ChunkedStream):
                         output_emitter.push(data)
 
                 output_emitter.flush()
+
+                _logger.info(
+                    "TTS DONE %s total_ms=%d text=%r",
+                    request_id,
+                    round((time.perf_counter() - started) * 1000),
+                    self._input_text,
+                )
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
