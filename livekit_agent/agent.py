@@ -8,7 +8,7 @@ spawns a voice session in the client's room.
 Pipeline:
   VAD  -> silero (local, free)
   STT  -> self-hosted faster-whisper server  (livekit_agent.stt.WhisperHTTPSTT)
-  LLM  -> Groq llama-3.3-70b (tool-calls the library text-to-SQL backend)
+  LLM  -> Ollama qwen2.5:7b via OpenAI-compatible plugin (tool-calls the library text-to-SQL backend)
   TTS  -> self-hosted Kokoro server          (livekit_agent.tts.KokoroHTTPTTS)
 
 Lifecycle logging:
@@ -33,7 +33,7 @@ import httpx
 
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentServer, AgentSession, function_tool, room_io, TurnHandlingOptions, inference, RunContext
-from livekit.plugins import groq, silero
+from livekit.plugins import openai, silero
 
 # try:
 #     from livekit.plugins import dtln
@@ -56,6 +56,7 @@ if not _LOGS_ENABLED:
 class SessionData:
     thread_id: str = ""
     mem_cd: str = ""
+    user_name: str = ""
 
 
 _session_started_at: float = 0.0
@@ -177,13 +178,18 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         agent_name=settings.agent_name,
     )
 
-    # ---- debug: verify which GROQ key is loaded ----
-    _k = settings.groq_api_key
+    # ---- debug: verify which voice LLM config is loaded ----
+    _k = settings.voice_llm_api_key
     if _k:
         _masked = _k[:6] + "..." + _k[-4:] if len(_k) > 10 else "***"
     else:
         _masked = "<EMPTY>"
-    _log("GROQ API KEY CHECK", key_masked=_masked, model=settings.groq_model)
+    _log(
+        "VOICE LLM CONFIG",
+        key_masked=_masked,
+        model=settings.voice_llm_model,
+        base_url=settings.voice_llm_base_url,
+    )
 
     # ---- job metadata (dispatch payload from the backend) ----
     meta: dict = {}
@@ -196,6 +202,16 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
     session_data = SessionData(
         thread_id=str(meta.get("thread_id") or ""),
         mem_cd=str(meta.get("user_id") or ""),
+        user_name=str(meta.get("user_name") or "").strip(),
+    )
+
+    _log(
+        "AGENT USER NAME RESOLVED",
+        event="user_name",
+        job_id=job.id,
+        raw_user_name=meta.get("user_name"),
+        resolved_user_name=session_data.user_name,
+        has_name=bool(session_data.user_name),
     )
 
     _log(
@@ -252,14 +268,18 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
         room=ctx.room.name,
         vad="silero",
         stt=f"whisper-http({settings.stt_url})",
-        llm=f"groq({settings.groq_model})",
+        llm=f"openai({settings.voice_llm_model})",
         tts=f"kokoro-http({settings.tts_url})",
     )
 
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=WhisperHTTPSTT(),
-        llm=groq.LLM(model=settings.groq_model),
+        llm=openai.LLM(
+            model=settings.voice_llm_model,
+            base_url=settings.voice_llm_base_url,
+            api_key=settings.voice_llm_api_key,
+        ),
         tts=KokoroHTTPTTS(),
         userdata=session_data,
         # turn_handling={
@@ -331,20 +351,31 @@ async def library_assistant_session(ctx: agents.JobContext) -> None:
     )
 
     _log(
-        "AGENT GENERATING GREETING",
+        "AGENT PLAYING FIXED GREETING",
         event="greeting",
         job_id=job.id,
         room=ctx.room.name,
     )
     
-    await session.generate_reply(
-        instructions=(
-            "Start by greeting the user warmly as the SOUL Library assistant in Hindi language, "
-            "and ask what they would like to know about the library. "
-            "Do NOT call any tools and do NOT fetch any library information in this greeting - "
-            "just greet and ask the question."
+    if session_data.user_name:
+        greeting = (
+            f"नमस्ते {session_data.user_name}! मैं सोल लाइब्रेरी असिस्टेंट हूँ। "
+            "आप लाइब्रेरी के बारे में क्या जानना चाहेंगे?"
         )
+    else:
+        greeting = (
+            "नमस्ते! मैं सोल लाइब्रेरी असिस्टेंट हूँ। "
+            "आप लाइब्रेरी के बारे में क्या जानना चाहेंगे?"
+        )
+    _log(
+        "AGENT GREETING TEXT",
+        event="greeting_text",
+        job_id=job.id,
+        room=ctx.room.name,
+        user_name=session_data.user_name,
+        greeting=greeting,
     )
+    await session.say(greeting)
 
     _log(
         "AGENT GREETING COMPLETE",

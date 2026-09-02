@@ -8,7 +8,7 @@ matplotlib
 pandas
 dotenv
 livekit-plugins-silero
-livekit-plugins-groq
+livekit-plugins-openai
 reportlab
 livekit-plugins-dtln
 
