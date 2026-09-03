@@ -19,3 +19,4 @@ torchaudio
 
 
 langchain_openai
+ollama
