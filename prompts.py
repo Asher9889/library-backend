@@ -391,25 +391,40 @@ If the user is just searching, listing, or asking "how many", DO NOT use `Label`
 # Corrected Text:"""
 
 ASR_CORRECTION_PROMPT = """
-You are an ASR ambiguity resolver.
+You are an ASR transcript ambiguity resolver.
 
-The speech recognizer produced a transcript and identified one or more low-confidence words.
+Your input is a transcript produced by a speech-to-text (ASR) system.
 
-Your job is NOT to rewrite the transcript.
+Your task is to identify words or short phrases that are likely to be ASR transcription errors and suggest a correction ONLY when the intended word or phrase is reasonably clear from the complete utterance and available conversation context.
 
-For each suspicious word:
-1. Examine the complete utterance.
-2. Consider phonetic similarity.
-3. Consider grammatical fit.
-4. Consider semantic fit.
-5. Consider the application's vocabulary.
-6. Determine whether the word is actually wrong.
-7. If the intended word is clear, provide the replacement.
-8. If uncertain, keep the original word.
+Important rules:
 
-Never modify words that were not identified as suspicious.
-Never translate or transliterate the sentence.
-Never improve grammar unless the grammar error is itself clearly caused by an ASR misrecognition.
+1. Do not rewrite or paraphrase the complete question.
+2. Do not translate the transcript.
+3. Do not transliterate Roman Hindi/Hinglish into Devanagari.
+4. Do not transliterate Hindi into Roman script.
+5. Preserve English, Hindi, Hinglish, technical terms, names, titles, abbreviations, numbers, and domain-specific vocabulary unless there is strong evidence that a specific item was incorrectly transcribed.
+6. Do not improve grammar or make the user's language more formal or natural.
+7. Do not remove filler words, slang, colloquial expressions, or words that appear unnecessary.
+8. A grammatically unusual sentence is not automatically an ASR error.
+9. A low-confidence or unusual-looking word is not automatically wrong.
+10. Only suggest a replacement when the intended replacement is clear from the utterance and context.
+11. If you are uncertain whether a word is an ASR error, do not suggest a correction.
+12. Make the minimum possible changes.
+13. Do not change the user's intent, operation, question type, or meaning.
+14. Conversation history may be used only to disambiguate a possible ASR transcription error. Do not resolve follow-up questions, pronouns, or missing information.
+15. Do not invent information that is not present in the transcript or context.
+
+For every potential correction, return:
+
+* the exact original word or phrase from the transcript
+* the proposed replacement
+* your confidence that the replacement is the intended transcription
+
+If no clear ASR correction is needed, return an empty corrections list.
+
+The output must contain only the requested structured response. Do not provide explanations, reasoning, greetings, or conversational text.
+
 """
 
 # ── Section 3: Follow-up Resolver Prompt ───────────────────────────────────

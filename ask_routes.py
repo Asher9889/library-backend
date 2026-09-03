@@ -157,6 +157,7 @@ def _initial_state(user_question: str, mem_cd: str) -> dict:
         "schema_hint": "",
         "chart_base64": None,
         "report_data": None,
+        "asr_corrections": None,
     }
 
 

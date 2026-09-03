@@ -25,6 +25,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
 from config import (
     MAX_HISTORY_TURNS,
@@ -39,6 +40,21 @@ from llm.ollama import generate as ollama_generate
 from prompts import ASR_CORRECTION_PROMPT, FOLLOWUP_RESOLVER_PROMPT, SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+class ASRCorrection(BaseModel):
+    """Single ASR correction suggestion."""
+
+    original: str
+    replacement: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class ASRCorrectionResult(BaseModel):
+    """Structured ASR correction response from the LLM."""
+
+    corrections: List[ASRCorrection]
+
 
 # ── LangGraph state ────────────────────────────────────────────────────────
 
@@ -63,6 +79,7 @@ class AgentState(TypedDict):
     chart_base64: Optional[str]
     chat_history: List[ChatTurn]
     mem_cd: Optional[str]
+    asr_corrections: Optional[Dict[str, Any]]
 
 
 # ── Token tracker (shared, reset per request) ─────────────────────────────
@@ -225,19 +242,32 @@ def correct_asr_errors_node(state: AgentState):
 
     prompt = ASR_CORRECTION_PROMPT.format(history=history_str, question=question)
 
-    try:
-        corrected = ollama_generate(prompt)
+    schema = ASRCorrectionResult.model_json_schema()
 
-        if not corrected or len(corrected) > len(question) * 3:
-            print("[ASR] LLM returned invalid response. Falling back to original.")
-            corrected = question
+    try:
+        import ollama
+
+        base_url = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1")
+        client = ollama.Client(host=base_url)
+        resp = client.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            format=schema,
+            options={"temperature": 0},
+        )
+
+        content = (resp.get("message", {}).get("content") or "").strip()
+        print(f"[ASR CORRECTION] LLM returned: {content}")
+
+        result = ASRCorrectionResult.model_validate_json(content)
 
         print(f"[ASR] Original : {question}")
-        print(f"[ASR] Corrected: {corrected}")
-        return {"corrected_question": corrected}
+        print(f"[ASR] Corrections: {result.model_dump()}")
+
+        return {"corrected_question": question, "asr_corrections": result.model_dump()}
     except Exception as e:
         print(f"[ASR] Error: {e}. Falling back to original.")
-        return {"corrected_question": question}
+        return {"corrected_question": question, "asr_corrections": {"corrections": []}}
 
 
 def resolve_followup_node(state: AgentState):

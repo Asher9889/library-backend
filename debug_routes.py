@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import ollama
 from config import OLLAMA_BASE_URL, OLLAMA_MODEL
@@ -51,6 +51,20 @@ class NodeOutput(BaseModel):
     logs: List[str]
 
 
+class ASRCorrection(BaseModel):
+    """Single ASR correction suggestion."""
+
+    original: str
+    replacement: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class ASRCorrectionResult(BaseModel):
+    """Structured ASR correction response from the LLM."""
+
+    corrections: List[ASRCorrection]
+
+
 # ── correct_asr_errors ─────────────────────────────────────────────────────
 
 
@@ -58,8 +72,8 @@ def _run_correct_asr_errors(req: CorrectAsrRequest) -> NodeOutput:
     """Mirror of ``correct_asr_errors_node`` in sql_agent.py.
 
     Builds the ASR-correction prompt with history, calls the local
-    LLM, and falls back to the original question on failure or on
-    a suspiciously-long/garbled reply.
+    LLM with structured JSON output, validates the response, and
+    falls back to the original question on failure.
     """
     logs: List[str] = []
     logs.append("STEP: correct_asr_errors")
@@ -75,33 +89,37 @@ def _run_correct_asr_errors(req: CorrectAsrRequest) -> NodeOutput:
         history_str = "No history"
     logs.append(f"HISTORY_USED: {history_str}")
 
-    prompt = ASR_CORRECTION_PROMPT.format(history=history_str, question=question)
-    logs.append(f"PROMPT: {prompt}")
+    system_prompt = ASR_CORRECTION_PROMPT.format(history=history_str)
+    logs.append(f"SYSTEM_PROMPT: {system_prompt}")
+
+    schema = ASRCorrectionResult.model_json_schema()
 
     try:
         base_url = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1")
         client = ollama.Client(host=base_url)
-        resp = client.generate(model=OLLAMA_MODEL, prompt=prompt, options={"temperature": 0})
-        corrected = (resp.get("response") or "").strip()
-        
-        print(f"[ASR CORRECTION] LLM returned: {corrected}")
+        resp = client.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ],
+            format=schema,
+            options={"temperature": 0},
+        )
 
-        if not corrected or len(corrected) > len(question) * 3:
-            logs.append(
-                "LLM returned invalid response (empty or >3x length); "
-                "falling back to original."
-            )
-            corrected = question
-        else:
-            print(f"[ASR CORRECTION] LLM returned valid response: {corrected}")
-            logs.append(f"LLM_REPLY: {corrected}")
+        content = (resp.get("message", {}).get("content") or "").strip()
+        print(f"[ASR CORRECTION] LLM returned: {content}")
 
+        result = ASRCorrectionResult.model_validate_json(content)
+
+        logs.append(f"LLM_REPLY: {result.model_dump_json()}")
         logs.append(f"ORIGINAL: {question}")
-        logs.append(f"CORRECTED: {corrected}")
-        output = {"corrected_question": corrected}
+
+        output = {"corrections": result.model_dump()}
+
     except Exception as e:
         logs.append(f"ERROR: {e}; falling back to original.")
-        output = {"corrected_question": question}
+        output = {"corrections": {"corrections": []}, "corrected_question": question}
 
     return NodeOutput(
         node="correct_asr_errors",
